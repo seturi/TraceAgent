@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-import gzip
 import json
 import sqlite3
-import zlib
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
-import brotli
 from ccl_chromium_reader import ccl_chromium_cache
 
 from core.models import AgentAttribution, ArtifactRecord, EvidenceSource, NormalizedEvent
+from parsers._cache_utils import decode_body, try_parse_json
 from parsers.base import ArtifactParser, EventSink, ParseContext, ParserMetadata
 from version import __version__
 
@@ -44,37 +42,6 @@ def _parse_iso(value: object) -> datetime | None:
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
-        return None
-
-
-def _decode_body(body: bytes, encoding: str) -> bytes:
-    encoding = encoding.strip().lower()
-    if not body or not encoding:
-        return body
-    if encoding == "gzip":
-        try:
-            return gzip.decompress(body)
-        except (EOFError, gzip.BadGzipFile):
-            return body
-    if encoding == "br":
-        try:
-            return brotli.decompress(body)
-        except brotli.error:
-            return body
-    if encoding == "deflate":
-        try:
-            return zlib.decompress(body, -zlib.MAX_WBITS)
-        except zlib.error:
-            return body
-    return body
-
-
-def _try_parse_json(body: bytes) -> object | None:
-    if not body:
-        return None
-    try:
-        return json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
         return None
 
 
@@ -261,8 +228,9 @@ class CodexParser(ArtifactParser):
     ) -> None:
         cache_dir = Path(artifact.path)
         fallback_timestamp = _mtime_fallback(cache_dir)
+        cache_class = ccl_chromium_cache.guess_cache_class(cache_dir) or ccl_chromium_cache.ChromiumSimpleFileCache
 
-        with ccl_chromium_cache.ChromiumSimpleFileCache(cache_dir) as cache:
+        with cache_class(cache_dir) as cache:
             for key in cache.keys():
                 if context.cancelled():
                     return
@@ -274,7 +242,7 @@ class CodexParser(ArtifactParser):
                 meta = next(iter(cache.get_metadata(key)), None)
                 body = next(iter(cache.get_cachefile(key)), b"")
                 encoding = (meta.get_attribute("content-encoding") or [""])[0] if meta is not None else ""
-                conversation = _try_parse_json(_decode_body(body, encoding))
+                conversation = try_parse_json(decode_body(body, encoding))
                 if conversation is None:
                     continue
 
