@@ -15,7 +15,7 @@ _SERVICE_NAME = "Codex"
 
 _CACHE_GLOB = "**/Packages/OpenAI.Codex_*/LocalCache/Roaming/Codex/web/Codex/Default/Cache/Cache_Data"
 _CODEX_HOME_GLOB = "**/.codex"
-_LOG_DB_GLOB = "log_*.sqlite"
+_LOG_DB_GLOB = "logs_*.sqlite"
 _STATE_DB_GLOB = "state_*.sqlite"
 _SESSIONS_GLOB = "sessions/**/*.jsonl"
 
@@ -213,14 +213,19 @@ class CodexParser(ArtifactParser):
             if context.cancelled():
                 return
 
-            if artifact.artifact_type == _CACHE_ARTIFACT_TYPE:
-                self._parse_cache(source, artifact, emit, context)
-            elif artifact.artifact_type == _LOG_DB_ARTIFACT_TYPE:
-                self._parse_sqlite_table(source, artifact, "logs", emit, context)
-            elif artifact.artifact_type == _STATE_DB_ARTIFACT_TYPE:
-                self._parse_sqlite_table(source, artifact, "threads", emit, context)
-            elif artifact.artifact_type == _SESSION_ARTIFACT_TYPE:
-                self._parse_session_jsonl(source, artifact, emit, context)
+            try:
+                if artifact.artifact_type == _CACHE_ARTIFACT_TYPE:
+                    self._parse_cache(source, artifact, emit, context)
+                elif artifact.artifact_type == _LOG_DB_ARTIFACT_TYPE:
+                    self._parse_sqlite_table(source, artifact, "logs", emit, context)
+                elif artifact.artifact_type == _STATE_DB_ARTIFACT_TYPE:
+                    self._parse_sqlite_table(source, artifact, "threads", emit, context)
+                elif artifact.artifact_type == _SESSION_ARTIFACT_TYPE:
+                    self._parse_session_jsonl(source, artifact, emit, context)
+            except (OSError, sqlite3.Error) as exc:
+                context.options.setdefault("codex_errors", []).append(
+                    f"{artifact.path}: {exc}"
+                )
 
             context.progress(int((index + 1) / total * 100), f"Parsed {artifact.path}")
 
@@ -283,6 +288,7 @@ class CodexParser(ArtifactParser):
                 if timestamp_column is not None:
                     timestamp = _coerce_timestamp(row_dict.get(timestamp_column))
                 timestamp = timestamp or fallback_timestamp
+                session_id = row_dict.get("id") if table_name == "threads" else None
 
                 emit(
                     NormalizedEvent(
@@ -291,6 +297,7 @@ class CodexParser(ArtifactParser):
                         timestamp=timestamp,
                         event_type=f"codex_{table_name}_record",
                         service=_SERVICE_NAME,
+                        session_id=session_id,
                         attribution=AgentAttribution.HIGH,
                         attribution_score=0.8,
                         attribution_reasons=(f"codex_desktop_{table_name}_table",),
