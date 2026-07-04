@@ -22,12 +22,27 @@ _LOCAL_STORAGE_ARTIFACT_TYPE = "chromium_local_storage"
 def _find_chatgpt_roots(location: Path) -> tuple[Path, ...]:
     if not location.exists():
         return ()
-    roots = {
+    roots: set[Path] = set()
+
+    # The source may already point straight at the ChatGPT-Desktop root itself
+    # (e.g. after a manual extraction that dropped the Packages/... ancestry).
+    if (location / "Cache" / "Cache_Data").is_dir() or (location / "Local Storage" / "leveldb").is_dir():
+        roots.add(location)
+
+    # Or straight at one of the artifact folders themselves (e.g. the leveldb
+    # directory was pasted in directly) — walk back up to the root in that case.
+    if location.name.lower() == "leveldb" and location.parent.name.lower() == "local storage":
+        roots.add(location.parent.parent)
+    if location.name.lower() == "cache_data" and location.parent.name.lower() == "cache":
+        roots.add(location.parent.parent)
+
+    roots.update(
         path
         for pattern in _PACKAGE_ROOT_GLOBS
         for path in location.glob(pattern)
         if path.is_dir()
-    }
+    )
+
     return tuple(sorted(roots))
 
 
@@ -151,10 +166,15 @@ class ChatGPTParser(ArtifactParser):
             if context.cancelled():
                 return
 
-            if artifact.artifact_type == _LOCAL_STORAGE_ARTIFACT_TYPE:
-                self._parse_local_storage(source, artifact, emit, context)
-            elif artifact.artifact_type == _CACHE_ARTIFACT_TYPE:
-                self._parse_cache(source, artifact, emit, context)
+            try:
+                if artifact.artifact_type == _LOCAL_STORAGE_ARTIFACT_TYPE:
+                    self._parse_local_storage(source, artifact, emit, context)
+                elif artifact.artifact_type == _CACHE_ARTIFACT_TYPE:
+                    self._parse_cache(source, artifact, emit, context)
+            except Exception as exc:  # noqa: BLE001 - one bad artifact must not sink the rest
+                context.options.setdefault("chatgpt_errors", []).append(
+                    f"{artifact.path}: {exc}"
+                )
 
             context.progress(int((index + 1) / total * 100), f"Parsed {artifact.path}")
 
@@ -165,6 +185,8 @@ class ChatGPTParser(ArtifactParser):
         fallback_timestamp = _mtime_fallback(leveldb_dir)
 
         result = self._local_storage_parser.parse(leveldb_dir)
+        if result.issues:
+            context.options.setdefault("chatgpt_local_storage_issues", []).extend(result.issues)
         for record in result.records:
             if context.cancelled():
                 return
@@ -199,6 +221,8 @@ class ChatGPTParser(ArtifactParser):
             include_body=True,
             cancelled=context.cancelled,
         )
+        if result.issues:
+            context.options.setdefault("chatgpt_cache_issues", []).extend(result.issues)
         for record in result.records:
             if "conversation" not in record.url.lower():
                 continue

@@ -45,9 +45,16 @@ class ChromiumCacheRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ChromiumCacheIssue:
+    key: str
+    error: str
+
+
+@dataclass(frozen=True, slots=True)
 class ChromiumCacheResult:
     artifact: ChromiumCacheArtifact
     records: tuple[ChromiumCacheRecord, ...]
+    issues: tuple[ChromiumCacheIssue, ...] = ()
 
 
 def _default_reader_factory(cache_path: Path) -> Any:
@@ -143,6 +150,7 @@ class ChromiumCacheParser:
     ) -> ChromiumCacheResult:
         artifact = self._coerce_artifact(artifact)
         records: list[ChromiumCacheRecord] = []
+        issues: list[ChromiumCacheIssue] = []
 
         with ExitStack() as stack:
             reader = self._reader_factory(artifact.cache_path)
@@ -157,13 +165,17 @@ class ChromiumCacheParser:
             for key in cache.keys():
                 if cancelled is not None and cancelled():
                     break
-                cache_key = self._cache_key_factory(key)
-                metadata = next(iter(cache.get_metadata(key)), None)
-                headers: dict[str, list[str]] = {}
-                if metadata is not None:
-                    for name, value in metadata.http_header_attributes:
-                        headers.setdefault(name.lower(), []).append(value)
-                body = next(iter(cache.get_cachefile(key)), b"") if include_body else b""
+                try:
+                    cache_key = self._cache_key_factory(key)
+                    metadata = next(iter(cache.get_metadata(key)), None)
+                    headers: dict[str, list[str]] = {}
+                    if metadata is not None:
+                        for name, value in metadata.http_header_attributes:
+                            headers.setdefault(name.lower(), []).append(value)
+                    body = next(iter(cache.get_cachefile(key)), b"") if include_body else b""
+                except Exception as exc:  # noqa: BLE001 - isolate one corrupt entry from the rest
+                    issues.append(ChromiumCacheIssue(key=str(key), error=str(exc)))
+                    continue
                 records.append(
                     ChromiumCacheRecord(
                         key=str(key),
@@ -175,7 +187,7 @@ class ChromiumCacheParser:
                     )
                 )
 
-        return ChromiumCacheResult(artifact, tuple(records))
+        return ChromiumCacheResult(artifact, tuple(records), tuple(issues))
 
     def _artifact(self, cache_path: Path) -> ChromiumCacheArtifact:
         return ChromiumCacheArtifact(

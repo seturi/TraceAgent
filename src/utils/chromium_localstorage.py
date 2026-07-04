@@ -33,9 +33,16 @@ class ChromiumLocalStorageRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ChromiumLocalStorageIssue:
+    sequence_number: int | None
+    error: str
+
+
+@dataclass(frozen=True, slots=True)
 class ChromiumLocalStorageResult:
     artifact: ChromiumLocalStorageArtifact
     records: tuple[ChromiumLocalStorageRecord, ...]
+    issues: tuple[ChromiumLocalStorageIssue, ...] = ()
 
 
 def _default_reader_factory(leveldb_path: Path) -> Any:
@@ -92,37 +99,56 @@ class ChromiumLocalStorageParser:
     def parse(self, artifact: ChromiumLocalStorageArtifact | Path) -> ChromiumLocalStorageResult:
         artifact = self._coerce_artifact(artifact)
         records: list[ChromiumLocalStorageRecord] = []
+        issues: list[ChromiumLocalStorageIssue] = []
         database = self._reader_factory(artifact.leveldb_path)
         try:
-            for record in database.iter_all_records(include_deletions=True):
-                find_batch = getattr(database, "find_batch", None)
-                batch = find_batch(record.leveldb_seq_number) if callable(find_batch) else None
-                records.append(
-                    ChromiumLocalStorageRecord(
-                        storage_key=to_json_safe(
-                            record.storage_key,
-                            decode_nested_json=self._decode_nested_json,
-                        ),
-                        script_key=to_json_safe(
-                            record.script_key,
-                            decode_nested_json=self._decode_nested_json,
-                        ),
-                        value=to_json_safe(
-                            record.value,
-                            decode_nested_json=self._decode_nested_json,
-                        ),
-                        sequence_number=record.leveldb_seq_number,
-                        is_live=record.is_live,
-                        timestamp=getattr(batch, "timestamp", None),
+            try:
+                iterator = iter(database.iter_all_records(include_deletions=True))
+            except Exception as exc:  # noqa: BLE001 - surface as an issue instead of aborting
+                issues.append(ChromiumLocalStorageIssue(None, str(exc)))
+                iterator = iter(())
+
+            while True:
+                try:
+                    record = next(iterator)
+                except StopIteration:
+                    break
+                except Exception as exc:  # noqa: BLE001 - a corrupt record ends iteration; keep what we have
+                    issues.append(ChromiumLocalStorageIssue(None, str(exc)))
+                    break
+
+                try:
+                    find_batch = getattr(database, "find_batch", None)
+                    batch = find_batch(record.leveldb_seq_number) if callable(find_batch) else None
+                    records.append(
+                        ChromiumLocalStorageRecord(
+                            storage_key=to_json_safe(
+                                record.storage_key,
+                                decode_nested_json=self._decode_nested_json,
+                            ),
+                            script_key=to_json_safe(
+                                record.script_key,
+                                decode_nested_json=self._decode_nested_json,
+                            ),
+                            value=to_json_safe(
+                                record.value,
+                                decode_nested_json=self._decode_nested_json,
+                            ),
+                            sequence_number=record.leveldb_seq_number,
+                            is_live=record.is_live,
+                            timestamp=getattr(batch, "timestamp", None),
+                        )
                     )
-                )
+                except Exception as exc:  # noqa: BLE001 - isolate one corrupt record from the rest
+                    sequence_number = getattr(record, "leveldb_seq_number", None)
+                    issues.append(ChromiumLocalStorageIssue(sequence_number, str(exc)))
         finally:
             close = getattr(database, "close", None)
             if callable(close):
                 close()
 
         records.sort(key=lambda item: item.sequence_number)
-        return ChromiumLocalStorageResult(artifact, tuple(records))
+        return ChromiumLocalStorageResult(artifact, tuple(records), tuple(issues))
 
     def _artifact(self, leveldb_path: Path) -> ChromiumLocalStorageArtifact:
         return ChromiumLocalStorageArtifact(

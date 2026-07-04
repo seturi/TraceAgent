@@ -8,18 +8,15 @@ from pathlib import Path
 
 from core.models import AgentAttribution, ArtifactRecord, EvidenceSource, NormalizedEvent
 from parsers.base import ArtifactParser, EventSink, ParseContext, ParserMetadata
-from utils.chromium_cache import ChromiumCacheParser, decode_body, try_parse_json
 from version import __version__
 
 _SERVICE_NAME = "Codex"
 
-_CACHE_GLOB = "**/Packages/OpenAI.Codex_*/LocalCache/Roaming/Codex/web/Codex/Default/Cache/Cache_Data"
 _CODEX_HOME_GLOB = "**/.codex"
 _LOG_DB_GLOB = "logs_*.sqlite"
 _STATE_DB_GLOB = "state_*.sqlite"
 _SESSIONS_GLOB = "sessions/**/*.jsonl"
 
-_CACHE_ARTIFACT_TYPE = "codex_cache"
 _LOG_DB_ARTIFACT_TYPE = "codex_log_db"
 _STATE_DB_ARTIFACT_TYPE = "codex_state_db"
 _SESSION_ARTIFACT_TYPE = "codex_session_jsonl"
@@ -28,6 +25,25 @@ _TIMESTAMP_COLUMN_CANDIDATES = (
     "timestamp", "created_at", "createdat", "updated_at", "updatedat",
     "ts", "time", "started_at", "startedat",
 )
+
+
+def _find_codex_homes(location: Path) -> tuple[Path, ...]:
+    if not location.exists():
+        return ()
+    homes: set[Path] = set()
+
+    # The source may already be the .codex home itself (named ".codex" or not,
+    # e.g. after a manual extraction that dropped the original folder name).
+    if (
+        location.name == ".codex"
+        or any(location.glob(_LOG_DB_GLOB))
+        or any(location.glob(_STATE_DB_GLOB))
+        or (location / "sessions").is_dir()
+    ):
+        homes.add(location)
+
+    homes.update(path for path in location.glob(_CODEX_HOME_GLOB) if path.is_dir())
+    return tuple(sorted(homes))
 
 
 def _mtime_fallback(path: Path) -> datetime:
@@ -66,6 +82,11 @@ def _derive_actor(record_type: str, payload: dict) -> str | None:
         role = payload.get("role")
         if isinstance(role, str):
             return role
+        sub_type = payload.get("type")
+        if sub_type == "function_call":
+            return "assistant"
+        if sub_type == "function_call_output":
+            return "tool"
     if record_type == "event_msg":
         sub_type = payload.get("type")
         if sub_type == "user_message":
@@ -105,10 +126,7 @@ def _json_safe(value: object) -> object:
 
 
 class CodexParser(ArtifactParser):
-    """Parses Codex Desktop's Chromium cache, sqlite logs/threads, and session JSONL artifacts."""
-
-    def __init__(self, *, cache_parser: ChromiumCacheParser | None = None) -> None:
-        self._cache_parser = cache_parser or ChromiumCacheParser()
+    """Parses Codex's .codex sqlite logs/threads tables and session JSONL transcripts."""
 
     @property
     def metadata(self) -> ParserMetadata:
@@ -119,8 +137,7 @@ class CodexParser(ArtifactParser):
             version=__version__,
             services=(_SERVICE_NAME,),
             description=(
-                "Parses Codex Desktop's Chromium disk cache, .codex sqlite logs/threads tables, "
-                "and .codex/sessions JSONL transcripts."
+                "Parses Codex's .codex sqlite logs/threads tables and .codex/sessions JSONL transcripts."
             ),
             implementation_status="ready",
         )
@@ -129,33 +146,15 @@ class CodexParser(ArtifactParser):
         location = source.location
         if not location.exists():
             return 0.0
-        has_cache = any(path.is_dir() for path in location.glob(_CACHE_GLOB))
-        has_home = any(path.is_dir() for path in location.glob(_CODEX_HOME_GLOB))
-        return 0.85 if (has_cache or has_home) else 0.0
+        return 0.85 if _find_codex_homes(location) else 0.0
 
     def discover(self, source: EvidenceSource, context: ParseContext) -> Iterable[ArtifactRecord]:
         location = source.location
-        cache_dirs = tuple(path for path in location.glob(_CACHE_GLOB) if path.is_dir())
-        codex_homes = tuple(path for path in location.glob(_CODEX_HOME_GLOB) if path.is_dir())
+        codex_homes = _find_codex_homes(location)
 
         records: list[ArtifactRecord] = []
-        total = len(cache_dirs) + len(codex_homes) or 1
+        total = len(codex_homes) or 1
         scanned = 0
-
-        for cache_dir in cache_dirs:
-            if context.cancelled():
-                return tuple(records)
-            records.append(
-                ArtifactRecord(
-                    source_id=source.source_id,
-                    producer_id=self.metadata.parser_id,
-                    path=str(cache_dir),
-                    artifact_type=_CACHE_ARTIFACT_TYPE,
-                    service=_SERVICE_NAME,
-                )
-            )
-            scanned += 1
-            context.progress(int(scanned / total * 100), f"Scanned {cache_dir}")
 
         for codex_home in codex_homes:
             if context.cancelled():
@@ -214,52 +213,18 @@ class CodexParser(ArtifactParser):
                 return
 
             try:
-                if artifact.artifact_type == _CACHE_ARTIFACT_TYPE:
-                    self._parse_cache(source, artifact, emit, context)
-                elif artifact.artifact_type == _LOG_DB_ARTIFACT_TYPE:
+                if artifact.artifact_type == _LOG_DB_ARTIFACT_TYPE:
                     self._parse_sqlite_table(source, artifact, "logs", emit, context)
                 elif artifact.artifact_type == _STATE_DB_ARTIFACT_TYPE:
                     self._parse_sqlite_table(source, artifact, "threads", emit, context)
                 elif artifact.artifact_type == _SESSION_ARTIFACT_TYPE:
                     self._parse_session_jsonl(source, artifact, emit, context)
-            except (OSError, sqlite3.Error) as exc:
+            except Exception as exc:  # noqa: BLE001 - one bad artifact must not sink the rest
                 context.options.setdefault("codex_errors", []).append(
                     f"{artifact.path}: {exc}"
                 )
 
             context.progress(int((index + 1) / total * 100), f"Parsed {artifact.path}")
-
-    def _parse_cache(
-        self, source: EvidenceSource, artifact: ArtifactRecord, emit: EventSink, context: ParseContext
-    ) -> None:
-        cache_dir = Path(artifact.path)
-        fallback_timestamp = _mtime_fallback(cache_dir)
-        result = self._cache_parser.parse(
-            cache_dir,
-            include_body=True,
-            cancelled=context.cancelled,
-        )
-        for record in result.records:
-            if "conversation" not in record.url.lower():
-                continue
-            conversation = try_parse_json(decode_body(record.body, record.content_encoding))
-            if conversation is None:
-                continue
-            emit(
-                NormalizedEvent(
-                    source_id=source.source_id,
-                    parser_id=self.metadata.parser_id,
-                    timestamp=record.response_time or fallback_timestamp,
-                    event_type="codex_cache_conversation",
-                    path=record.url,
-                    service=_SERVICE_NAME,
-                    attribution=AgentAttribution.HIGH,
-                    attribution_score=0.8,
-                    attribution_reasons=("codex_desktop_cache_conversation_url",),
-                    raw_reference=f"{artifact.record_id}:{record.raw_reference}",
-                    metadata={"cache_key": record.key, "conversation": conversation},
-                )
-            )
 
     def _parse_sqlite_table(
         self,
