@@ -1,17 +1,29 @@
 from __future__ import annotations
 
 import re
+import json
 from collections.abc import Iterable, Iterator, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from core.models import ArtifactRecord, EvidenceSource, NormalizedEvent
+from core.models import AgentAttribution, ArtifactRecord, EvidenceSource, NormalizedEvent
 from parsers.base import ArtifactParser, EventSink, ParseContext, ParserMetadata
+from parsers.claude_common import claude_record_events
 from utils.chromium_indexeddb import (
     ChromiumIndexedDbArtifact,
     ChromiumIndexedDbParser,
     ChromiumIndexedDbRecord,
+)
+from utils.structured_data import (
+    StructuredDataIssue,
+    file_timestamp,
+    iter_json_lines,
+    iter_timestamped_log,
+    json_safe,
+    load_collection_manifest,
+    parse_timestamp,
+    read_json_object,
 )
 from version import __version__
 
@@ -39,33 +51,93 @@ class ClaudeCoworkParser(ArtifactParser):
     def probe(self, source: EvidenceSource) -> float:
         root = source.location
         if self._indexeddb.is_leveldb_directory(root):
-            return 1.0 if root.name == CLAUDE_LEVELDB_NAME else 0.0
+            return 1.0 if _is_claude_leveldb_name(root.name) else 0.0
         expected = root / "IndexedDB" / CLAUDE_LEVELDB_NAME
         return 0.95 if self._indexeddb.is_leveldb_directory(expected) else 0.0
 
     def discover(self, source: EvidenceSource, context: ParseContext) -> Iterable[ArtifactRecord]:
-        artifacts = tuple(
+        search_roots = _service_roots(source.location, "Claude_Cowork")
+        manifest: dict[str, dict[str, Any]] = {}
+        for search_root in search_roots:
+            manifest.update(load_collection_manifest(search_root))
+        indexeddb_artifacts = tuple(
             artifact
-            for artifact in self._indexeddb.discover(source.location)
-            if artifact.leveldb_path.name == CLAUDE_LEVELDB_NAME
+            for search_root in search_roots
+            for artifact in self._indexeddb.discover(search_root)
+            if _is_claude_leveldb_name(artifact.leveldb_path.name)
         )
-        for index, artifact in enumerate(artifacts, start=1):
+        candidates: list[tuple[Path, str, int | None]] = [
+            (artifact.leveldb_path, "chromium_indexeddb_leveldb", artifact.size)
+            for artifact in indexeddb_artifacts
+        ]
+        patterns = (
+            ("**/local-agent-mode-sessions/**/audit.jsonl", "cowork_audit_jsonl"),
+            ("**/local-agent-mode-sessions/**/local_*.json", "cowork_session_metadata"),
+            ("**/local-agent-mode-sessions/**/.claude/projects/**/*.jsonl", "cowork_claude_jsonl"),
+            ("**/mcp-logs-*/*.jsonl", "cowork_mcp_log"),
+            ("**/local-agent-mode-sessions/**/outputs/**/*", "cowork_output_file"),
+            ("**/Roaming/Claude/logs/*.log", "cowork_application_log"),
+        )
+        for search_root in search_roots:
+            for pattern, artifact_type in patterns:
+                for path in search_root.glob(pattern):
+                    if path.is_file():
+                        candidates.append((path, artifact_type, path.stat().st_size))
+            for path in search_root.glob("agent_sessions__*"):
+                if not path.is_file():
+                    continue
+                original_name = path.name.split("__", 1)[-1].lower()
+                if path.suffix.lower() == ".jsonl":
+                    artifact_type = (
+                        "cowork_audit_jsonl"
+                        if original_name.startswith("audit")
+                        else "cowork_claude_jsonl"
+                    )
+                elif path.suffix.lower() == ".json" and original_name.startswith("local_"):
+                    artifact_type = "cowork_session_metadata"
+                else:
+                    artifact_type = "cowork_output_file"
+                candidates.append((path, artifact_type, path.stat().st_size))
+            candidates.extend(
+                (path, "cowork_mcp_log", path.stat().st_size)
+                for path in search_root.glob("mcp_logs__*.jsonl")
+                if path.is_file()
+            )
+            candidates.extend(
+                (path, "cowork_application_log", path.stat().st_size)
+                for path in search_root.glob("application_logs__*.log")
+                if path.is_file()
+            )
+
+        seen: set[Path] = set()
+        for index, (path, artifact_type, size) in enumerate(sorted(candidates), start=1):
             if context.cancelled():
                 break
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            manifest_entry = manifest.get(str(resolved).lower(), {})
             yield ArtifactRecord(
                 source_id=source.source_id,
                 producer_id=self.metadata.parser_id,
-                path=str(artifact.leveldb_path),
-                artifact_type="chromium_indexeddb_leveldb",
+                path=str(path),
+                artifact_type=artifact_type,
                 service="Claude Cowork",
-                size=artifact.size,
+                size=size,
+                original_path=(
+                    str(manifest_entry.get("original_path"))
+                    if manifest_entry.get("original_path")
+                    else None
+                ),
+                metadata=manifest_entry,
             )
             context.progress(
-                round(index / max(len(artifacts), 1) * 100),
-                f"Discovered {artifact.leveldb_path.name}",
+                round(index / max(len(candidates), 1) * 100),
+                f"Discovered {path.name}",
             )
-        if not artifacts:
-            context.progress(100, "No Claude IndexedDB LevelDB directory found.")
+        if not candidates:
+            context.progress(100, "No Claude Cowork artifacts found.")
 
     def parse(
         self,
@@ -75,20 +147,146 @@ class ClaudeCoworkParser(ArtifactParser):
         context: ParseContext,
     ) -> None:
         artifact_list = list(artifacts)
+        issues: list[StructuredDataIssue] = []
         for index, artifact_record in enumerate(artifact_list, start=1):
             if context.cancelled():
                 return
-            leveldb_path = Path(artifact_record.path)
-            result = self._indexeddb.parse(leveldb_path)
-            events = [self._to_event(source, result.artifact, record) for record in result.records]
-            _mark_final_prompt_candidates(events)
-            for event in events:
-                emit(event)
-            if result.issues:
-                context.options.setdefault("indexeddb_issues", []).extend(result.issues)
+            path = Path(artifact_record.path)
+            try:
+                if artifact_record.artifact_type == "chromium_indexeddb_leveldb":
+                    result = self._indexeddb.parse(path)
+                    events = [
+                        self._to_event(source, result.artifact, record)
+                        for record in result.records
+                    ]
+                    _mark_final_prompt_candidates(events)
+                    for event in events:
+                        emit(event)
+                    if result.issues:
+                        context.options.setdefault("indexeddb_issues", []).extend(result.issues)
+                elif artifact_record.artifact_type in {"cowork_audit_jsonl", "cowork_claude_jsonl"}:
+                    for record in iter_json_lines(path, issues):
+                        for event in claude_record_events(
+                            source,
+                            parser_id=self.metadata.parser_id,
+                            service="Claude Cowork",
+                            artifact=artifact_record,
+                            payload=record.value,
+                            line_number=record.line_number,
+                        ):
+                            emit(event)
+                elif artifact_record.artifact_type == "cowork_session_metadata":
+                    emit(self._session_metadata_event(source, artifact_record, read_json_object(path)))
+                elif artifact_record.artifact_type == "cowork_mcp_log":
+                    self._parse_mcp_log(source, artifact_record, emit, issues)
+                elif artifact_record.artifact_type == "cowork_application_log":
+                    self._parse_application_log(source, artifact_record, emit)
+                elif artifact_record.artifact_type == "cowork_output_file":
+                    emit(self._file_event(source, artifact_record))
+            except (OSError, ValueError) as exc:
+                issues.append(StructuredDataIssue(str(path), "file", str(exc)))
             context.progress(
                 round(index / max(len(artifact_list), 1) * 100),
-                f"Parsed {leveldb_path.name}",
+                f"Parsed {path.name}",
+            )
+        if issues:
+            context.options.setdefault("cowork_errors", []).extend(issues)
+
+    def _session_metadata_event(
+        self,
+        source: EvidenceSource,
+        artifact: ArtifactRecord,
+        payload: dict[str, Any],
+    ) -> NormalizedEvent:
+        path = Path(artifact.path)
+        timestamp = (
+            parse_timestamp(payload.get("lastActivityAt"))
+            or parse_timestamp(payload.get("createdAt"))
+            or file_timestamp(path)
+        )
+        return NormalizedEvent(
+            source_id=source.source_id,
+            parser_id=self.metadata.parser_id,
+            timestamp=timestamp,
+            event_type="cowork_session_metadata",
+            path=str(payload.get("cwd")) if payload.get("cwd") else None,
+            service="Claude Cowork",
+            session_id=str(payload.get("sessionId")) if payload.get("sessionId") else None,
+            result=str(payload.get("title")) if payload.get("title") else None,
+            raw_reference=artifact.record_id,
+            metadata=json_safe(payload),
+        )
+
+    def _parse_mcp_log(
+        self,
+        source: EvidenceSource,
+        artifact: ArtifactRecord,
+        emit: EventSink,
+        issues: list[StructuredDataIssue],
+    ) -> None:
+        for record in iter_json_lines(Path(artifact.path), issues):
+            debug = record.value.get("debug")
+            message = debug if isinstance(debug, str) else json.dumps(json_safe(debug), ensure_ascii=False)
+            tool_match = re.search(r"(?:Calling MCP tool:|Tool ['\"])([\w.-]+)", message)
+            tool_name = tool_match.group(1) if tool_match else None
+            failed = " failed " in f" {message.lower()} " or "access denied" in message.lower()
+            event_type = "cowork_mcp_tool_result" if failed else "cowork_mcp_tool_call" if tool_name else "cowork_mcp_log"
+            emit(
+                NormalizedEvent(
+                    source_id=source.source_id,
+                    parser_id=self.metadata.parser_id,
+                    timestamp=parse_timestamp(record.value.get("timestamp")) or file_timestamp(Path(artifact.path)),
+                    event_type=event_type,
+                    path=_text_path(message),
+                    service="Claude Cowork",
+                    session_id=(
+                        str(record.value.get("sessionId")) if record.value.get("sessionId") else None
+                    ),
+                    actor="assistant" if tool_name else None,
+                    tool_name=tool_name,
+                    command=message if tool_name and not failed else None,
+                    result=message if failed or not tool_name else None,
+                    attribution=AgentAttribution.CONFIRMED if tool_name else AgentAttribution.HIGH,
+                    attribution_score=1.0 if tool_name else 0.8,
+                    attribution_reasons=("cowork_mcp_log",),
+                    raw_reference=f"{artifact.record_id}:line={record.line_number}",
+                    metadata=json_safe(record.value),
+                )
+            )
+
+    def _file_event(self, source: EvidenceSource, artifact: ArtifactRecord) -> NormalizedEvent:
+        path = Path(artifact.path)
+        return NormalizedEvent(
+            source_id=source.source_id,
+            parser_id=self.metadata.parser_id,
+            timestamp=file_timestamp(path),
+            event_type=artifact.artifact_type,
+            path=str(path),
+            service="Claude Cowork",
+            raw_reference=artifact.record_id,
+            metadata={"size": path.stat().st_size, "suffix": path.suffix.lower()},
+        )
+
+    def _parse_application_log(
+        self,
+        source: EvidenceSource,
+        artifact: ArtifactRecord,
+        emit: EventSink,
+    ) -> None:
+        path = Path(artifact.path)
+        for record in iter_timestamped_log(path):
+            emit(
+                NormalizedEvent(
+                    source_id=source.source_id,
+                    parser_id=self.metadata.parser_id,
+                    timestamp=record.timestamp or file_timestamp(path),
+                    event_type="cowork_application_log",
+                    path=_text_path(record.message),
+                    service="Claude Cowork",
+                    result=record.message,
+                    raw_reference=f"{artifact.record_id}:line={record.line_number}",
+                    metadata={"level": record.level, "line_number": record.line_number},
+                )
             )
 
     def _to_event(
@@ -139,6 +337,13 @@ def _draft_session_id(key: Any) -> str | None:
         if key.startswith(prefix):
             return key[len(prefix):]
     return None
+
+
+def _is_claude_leveldb_name(name: str) -> bool:
+    lowered = name.lower()
+    return lowered == CLAUDE_LEVELDB_NAME or (
+        lowered.endswith(".indexeddb.leveldb") and "https_claude.ai_0" in lowered
+    )
 
 
 def _draft_text(value: Any) -> str | None:
@@ -259,3 +464,13 @@ def _mark_final_prompt_candidates(events: Iterable[NormalizedEvent]) -> None:
                 )
         else:
             last_active[event.session_id] = event
+
+
+def _text_path(text: str) -> str | None:
+    match = re.search(r"(?:[A-Za-z]:\\|/)[^\s'\"]+", text)
+    return match.group(0) if match else None
+
+
+def _service_roots(location: Path, service_directory: str) -> tuple[Path, ...]:
+    compact = location / service_directory
+    return (compact,) if compact.is_dir() else (location,)

@@ -1,6 +1,7 @@
 from utils.case_paths import CasePaths, create_case_paths
 from utils.chromium_cache import (
     ChromiumCacheArtifact,
+    ChromiumCacheIssue,
     ChromiumCacheParser,
     ChromiumCacheRecord,
     ChromiumCacheResult,
@@ -17,14 +18,31 @@ from utils.chromium_indexeddb import (
 )
 from utils.chromium_localstorage import (
     ChromiumLocalStorageArtifact,
+    ChromiumLocalStorageIssue,
     ChromiumLocalStorageParser,
     ChromiumLocalStorageRecord,
     ChromiumLocalStorageResult,
+)
+from utils.structured_data import (
+    JsonLineRecord,
+    SqliteRowRecord,
+    StructuredDataIssue,
+    TimestampedLogRecord,
+    file_timestamp,
+    iter_json_lines,
+    iter_sqlite_rows,
+    iter_timestamped_log,
+    json_safe,
+    load_collection_manifest,
+    parse_timestamp,
+    read_json_object,
+    sqlite_tables,
 )
 
 __all__ = [
     "CasePaths",
     "ChromiumCacheArtifact",
+    "ChromiumCacheIssue",
     "ChromiumCacheParser",
     "ChromiumCacheRecord",
     "ChromiumCacheResult",
@@ -34,11 +52,25 @@ __all__ = [
     "ChromiumIndexedDbRecord",
     "ChromiumIndexedDbResult",
     "ChromiumLocalStorageArtifact",
+    "ChromiumLocalStorageIssue",
     "ChromiumLocalStorageParser",
     "ChromiumLocalStorageRecord",
     "ChromiumLocalStorageResult",
     "ChromiumStorageDependencyError",
+    "JsonLineRecord",
+    "SqliteRowRecord",
+    "StructuredDataIssue",
+    "TimestampedLogRecord",
     "create_case_paths",
     "decode_body",
+    "file_timestamp",
+    "iter_json_lines",
+    "iter_sqlite_rows",
+    "iter_timestamped_log",
+    "json_safe",
+    "load_collection_manifest",
+    "parse_timestamp",
+    "read_json_object",
+    "sqlite_tables",
     "try_parse_json",
 ]

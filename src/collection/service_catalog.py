@@ -57,8 +57,10 @@ SERVICE_ARTIFACT_SPECS = (
     ServiceArtifactSpec(
         "Claude Cowork",
         "indexeddb",
-        ("AppData/Local/Packages/Claude_*/LocalCache/Roaming/Claude/IndexedDB",),
-        ("**/LocalCache/Roaming/Claude/IndexedDB",),
+        (
+            "AppData/Local/Packages/Claude_*/LocalCache/Roaming/Claude/IndexedDB/*.indexeddb.leveldb",
+        ),
+        ("**/LocalCache/Roaming/Claude/IndexedDB/*.indexeddb.leveldb",),
     ),
     ServiceArtifactSpec(
         "Claude Cowork",
@@ -72,6 +74,15 @@ SERVICE_ARTIFACT_SPECS = (
             "**/outputs/*",
             "**/outputs/**/*",
         ),
+    ),
+    ServiceArtifactSpec(
+        "Claude Cowork",
+        "mcp_logs",
+        (
+            "AppData/Local/Packages/Claude_*/LocalCache/Local/claude-cli-nodejs/Cache/**/mcp-logs-*",
+        ),
+        ("**/LocalCache/Local/claude-cli-nodejs/Cache/**/mcp-logs-*",),
+        include_file_patterns=("*.jsonl", "**/*.jsonl"),
     ),
     ServiceArtifactSpec(
         "Claude Code",
@@ -120,7 +131,10 @@ SERVICE_ARTIFACT_SPECS = (
         "brain_transcripts",
         (".gemini/antigravity/brain",),
         ("**/antigravity/brain",),
-        include_file_patterns=("**/logs/transcript*.jsonl",),
+        include_file_patterns=(
+            "**/logs/transcript*.jsonl",
+            "**/messages/*.json",
+        ),
     ),
     ServiceArtifactSpec(
         "Antigravity",

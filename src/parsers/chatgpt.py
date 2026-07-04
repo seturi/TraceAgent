@@ -8,6 +8,7 @@ from core.models import AgentAttribution, ArtifactRecord, EvidenceSource, Normal
 from parsers.base import ArtifactParser, EventSink, ParseContext, ParserMetadata
 from utils.chromium_cache import ChromiumCacheParser, decode_body, try_parse_json
 from utils.chromium_localstorage import ChromiumLocalStorageParser
+from utils.structured_data import load_collection_manifest
 from version import __version__
 
 _SERVICE_NAME = "ChatGPT Desktop"
@@ -109,6 +110,12 @@ class ChatGPTParser(ArtifactParser):
         )
 
     def probe(self, source: EvidenceSource) -> float:
+        compact = source.location / "ChatGPT_Desktop"
+        if compact.is_dir() and (
+            any(compact.glob("cache_data__*"))
+            or any(compact.glob("local_storage__*"))
+        ):
+            return 0.85
         roots = _find_chatgpt_roots(source.location)
         if not roots:
             return 0.0
@@ -150,6 +157,34 @@ class ChatGPTParser(ArtifactParser):
                 )
 
             context.progress(int((index + 1) / total * 100), f"Scanned {root}")
+
+        compact = source.location / "ChatGPT_Desktop"
+        if compact.is_dir():
+            manifest = load_collection_manifest(compact)
+            compact_artifacts = (
+                ("cache_data__*", _CACHE_ARTIFACT_TYPE),
+                ("local_storage__*", _LOCAL_STORAGE_ARTIFACT_TYPE),
+            )
+            for pattern, artifact_type in compact_artifacts:
+                for path in compact.glob(pattern):
+                    if not path.is_dir():
+                        continue
+                    entry = manifest.get(str(path.resolve()).lower(), {})
+                    records.append(
+                        ArtifactRecord(
+                            source_id=source.source_id,
+                            producer_id=self.metadata.parser_id,
+                            path=str(path),
+                            artifact_type=artifact_type,
+                            service=_SERVICE_NAME,
+                            original_path=(
+                                str(entry.get("original_path"))
+                                if entry.get("original_path")
+                                else None
+                            ),
+                            metadata=entry,
+                        )
+                    )
 
         return tuple(records)
 

@@ -20,6 +20,7 @@ _SESSIONS_GLOB = "sessions/**/*.jsonl"
 _LOG_DB_ARTIFACT_TYPE = "codex_log_db"
 _STATE_DB_ARTIFACT_TYPE = "codex_state_db"
 _SESSION_ARTIFACT_TYPE = "codex_session_jsonl"
+_HISTORY_ARTIFACT_TYPE = "codex_history_jsonl"
 
 _TIMESTAMP_COLUMN_CANDIDATES = (
     "timestamp", "created_at", "createdat", "updated_at", "updatedat",
@@ -143,14 +144,26 @@ class CodexParser(ArtifactParser):
         )
 
     def probe(self, source: EvidenceSource) -> float:
-        location = source.location
+        location = _service_root(source.location)
         if not location.exists():
             return 0.0
-        return 0.85 if _find_codex_homes(location) else 0.0
+        has_compact = any(
+            any(location.glob(pattern))
+            for pattern in (
+                "session_logs__*.jsonl",
+                "state_database__*.sqlite",
+                "history__*.jsonl",
+            )
+        )
+        return 0.85 if (_find_codex_homes(location) or has_compact) else 0.0
 
     def discover(self, source: EvidenceSource, context: ParseContext) -> Iterable[ArtifactRecord]:
-        location = source.location
-        codex_homes = _find_codex_homes(location)
+        location = _service_root(source.location)
+        codex_homes = (
+            ()
+            if (location / "collection_manifest.jsonl").is_file()
+            else _find_codex_homes(location)
+        )
 
         records: list[ArtifactRecord] = []
         total = len(codex_homes) or 1
@@ -197,6 +210,24 @@ class CodexParser(ArtifactParser):
             scanned += 1
             context.progress(int(scanned / total * 100), f"Scanned {codex_home}")
 
+        compact_patterns = (
+            ("session_logs__*.jsonl", _SESSION_ARTIFACT_TYPE),
+            ("state_database__*.sqlite", _STATE_DB_ARTIFACT_TYPE),
+            ("history__*.jsonl", _HISTORY_ARTIFACT_TYPE),
+        )
+        for pattern, artifact_type in compact_patterns:
+            for path in location.glob(pattern):
+                if path.is_file():
+                    records.append(
+                        ArtifactRecord(
+                            source_id=source.source_id,
+                            producer_id=self.metadata.parser_id,
+                            path=str(path),
+                            artifact_type=artifact_type,
+                            service=_SERVICE_NAME,
+                        )
+                    )
+
         return tuple(records)
 
     def parse(
@@ -219,6 +250,8 @@ class CodexParser(ArtifactParser):
                     self._parse_sqlite_table(source, artifact, "threads", emit, context)
                 elif artifact.artifact_type == _SESSION_ARTIFACT_TYPE:
                     self._parse_session_jsonl(source, artifact, emit, context)
+                elif artifact.artifact_type == _HISTORY_ARTIFACT_TYPE:
+                    self._parse_history_jsonl(source, artifact, emit, context)
             except Exception as exc:  # noqa: BLE001 - one bad artifact must not sink the rest
                 context.options.setdefault("codex_errors", []).append(
                     f"{artifact.path}: {exc}"
@@ -321,3 +354,38 @@ class CodexParser(ArtifactParser):
                         metadata=_sanitize_payload(payload),
                     )
                 )
+
+    def _parse_history_jsonl(
+        self, source: EvidenceSource, artifact: ArtifactRecord, emit: EventSink, context: ParseContext
+    ) -> None:
+        path = Path(artifact.path)
+        fallback = _mtime_fallback(path)
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            for line_number, line in enumerate(stream, start=1):
+                if context.cancelled():
+                    return
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                emit(
+                    NormalizedEvent(
+                        source_id=source.source_id,
+                        parser_id=self.metadata.parser_id,
+                        timestamp=_coerce_timestamp(record.get("ts")) or fallback,
+                        event_type="codex_history_entry",
+                        service=_SERVICE_NAME,
+                        session_id=record.get("session_id"),
+                        actor="user",
+                        result=record.get("text"),
+                        raw_reference=f"{artifact.record_id}:line={line_number}",
+                        metadata=record,
+                    )
+                )
+
+
+def _service_root(location: Path) -> Path:
+    compact = location / "Codex"
+    return compact if compact.is_dir() else location
