@@ -4,17 +4,17 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ccl_chromium_reader import ccl_chromium_cache, ccl_chromium_localstorage
-
 from core.models import AgentAttribution, ArtifactRecord, EvidenceSource, NormalizedEvent
-from parsers._cache_utils import decode_body, try_parse_json
 from parsers.base import ArtifactParser, EventSink, ParseContext, ParserMetadata
+from utils.chromium_cache import ChromiumCacheParser, decode_body, try_parse_json
+from utils.chromium_localstorage import ChromiumLocalStorageParser
 from version import __version__
 
 _SERVICE_NAME = "ChatGPT Desktop"
-# The app folder under Roaming has been observed as both "ChatGPT" and "ChatGPT-Desktop"
-# across versions, so the trailing wildcard matches either.
-_PACKAGE_ROOT_GLOB = "**/Packages/OpenAI.ChatGPT-Desktop_*/LocalCache/Roaming/ChatGPT*"
+_PACKAGE_ROOT_GLOBS = (
+    "**/Packages/OpenAI.ChatGPT-Desktop_*/LocalCache/Roaming/ChatGPT-Desktop",
+    "**/Packages/OpenAI.ChatGPT-Desktop_*/LocalCache/Roaming/ChatGPT",
+)
 _CACHE_ARTIFACT_TYPE = "chromium_simple_cache"
 _LOCAL_STORAGE_ARTIFACT_TYPE = "chromium_local_storage"
 
@@ -22,7 +22,13 @@ _LOCAL_STORAGE_ARTIFACT_TYPE = "chromium_local_storage"
 def _find_chatgpt_roots(location: Path) -> tuple[Path, ...]:
     if not location.exists():
         return ()
-    return tuple(sorted(path for path in location.glob(_PACKAGE_ROOT_GLOB) if path.is_dir()))
+    roots = {
+        path
+        for pattern in _PACKAGE_ROOT_GLOBS
+        for path in location.glob(pattern)
+        if path.is_dir()
+    }
+    return tuple(sorted(roots))
 
 
 def _mtime_fallback(path: Path) -> datetime:
@@ -62,6 +68,15 @@ def _iter_conversation_messages(conversation: dict):
 
 class ChatGPTParser(ArtifactParser):
     """Parses ChatGPT Desktop's local Chromium cache (conversation JSON) and Local Storage artifacts."""
+
+    def __init__(
+        self,
+        *,
+        cache_parser: ChromiumCacheParser | None = None,
+        local_storage_parser: ChromiumLocalStorageParser | None = None,
+    ) -> None:
+        self._cache_parser = cache_parser or ChromiumCacheParser()
+        self._local_storage_parser = local_storage_parser or ChromiumLocalStorageParser()
 
     @property
     def metadata(self) -> ParserMetadata:
@@ -149,129 +164,119 @@ class ChatGPTParser(ArtifactParser):
         leveldb_dir = Path(artifact.path)
         fallback_timestamp = _mtime_fallback(leveldb_dir)
 
-        with ccl_chromium_localstorage.LocalStoreDb(leveldb_dir) as local_storage:
-            for record in local_storage.iter_all_records():
-                if context.cancelled():
-                    return
-
-                batch = local_storage.find_batch(record.leveldb_seq_number)
-                timestamp = batch.timestamp if batch is not None else fallback_timestamp
-
-                emit(
-                    NormalizedEvent(
-                        source_id=source.source_id,
-                        parser_id=self.metadata.parser_id,
-                        timestamp=timestamp,
-                        event_type="chatgpt_local_storage_record",
-                        service=_SERVICE_NAME,
-                        attribution=AgentAttribution.HIGH,
-                        attribution_score=0.8,
-                        attribution_reasons=("chatgpt_desktop_local_storage_path",),
-                        raw_reference=artifact.record_id,
-                        metadata={
-                            "storage_key": record.storage_key,
-                            "script_key": record.script_key,
-                            "value": record.value,
-                            "leveldb_seq_number": record.leveldb_seq_number,
-                        },
-                    )
+        result = self._local_storage_parser.parse(leveldb_dir)
+        for record in result.records:
+            if context.cancelled():
+                return
+            emit(
+                NormalizedEvent(
+                    source_id=source.source_id,
+                    parser_id=self.metadata.parser_id,
+                    timestamp=record.timestamp or fallback_timestamp,
+                    event_type="chatgpt_local_storage_record",
+                    service=_SERVICE_NAME,
+                    attribution=AgentAttribution.HIGH,
+                    attribution_score=0.8,
+                    attribution_reasons=("chatgpt_desktop_local_storage_path",),
+                    raw_reference=f"{artifact.record_id}:{record.raw_reference}",
+                    metadata={
+                        "storage_key": record.storage_key,
+                        "script_key": record.script_key,
+                        "value": record.value,
+                        "leveldb_seq_number": record.sequence_number,
+                        "is_live": record.is_live,
+                    },
                 )
+            )
 
     def _parse_cache(
         self, source: EvidenceSource, artifact: ArtifactRecord, emit: EventSink, context: ParseContext
     ) -> None:
         cache_dir = Path(artifact.path)
         fallback_timestamp = _mtime_fallback(cache_dir)
-        cache_class = ccl_chromium_cache.guess_cache_class(cache_dir) or ccl_chromium_cache.ChromiumSimpleFileCache
+        result = self._cache_parser.parse(
+            cache_dir,
+            include_body=True,
+            cancelled=context.cancelled,
+        )
+        for record in result.records:
+            if "conversation" not in record.url.lower():
+                continue
+            conversation = try_parse_json(decode_body(record.body, record.content_encoding))
+            if not isinstance(conversation, dict) or "mapping" not in conversation:
+                continue
 
-        with cache_class(cache_dir) as cache:
-            for key in cache.keys():
+            conversation_id = conversation.get("conversation_id")
+            base_timestamp = (
+                _from_unix(conversation.get("create_time"))
+                or record.response_time
+                or fallback_timestamp
+            )
+            emit(
+                NormalizedEvent(
+                    source_id=source.source_id,
+                    parser_id=self.metadata.parser_id,
+                    timestamp=base_timestamp,
+                    event_type="chatgpt_conversation",
+                    path=record.url,
+                    service=_SERVICE_NAME,
+                    session_id=conversation_id,
+                    attribution=AgentAttribution.HIGH,
+                    attribution_score=0.85,
+                    attribution_reasons=("chatgpt_desktop_cache_conversation_json",),
+                    raw_reference=f"{artifact.record_id}:{record.raw_reference}",
+                    metadata={
+                        "cache_key": record.key,
+                        "title": conversation.get("title"),
+                        "default_model_slug": conversation.get("default_model_slug"),
+                        "current_node": conversation.get("current_node"),
+                        "create_time": conversation.get("create_time"),
+                        "update_time": conversation.get("update_time"),
+                        "gizmo_id": conversation.get("gizmo_id"),
+                        "is_archived": conversation.get("is_archived"),
+                    },
+                )
+            )
+
+            for node_id, node, message in _iter_conversation_messages(conversation):
                 if context.cancelled():
                     return
-
-                cache_key = ccl_chromium_cache.CacheKey(key)
-                if "conversation" not in cache_key.url.lower():
-                    continue
-
-                meta = next(iter(cache.get_metadata(key)), None)
-                body = next(iter(cache.get_cachefile(key)), b"")
-                encoding = (meta.get_attribute("content-encoding") or [""])[0] if meta is not None else ""
-                conversation = try_parse_json(decode_body(body, encoding))
-                if not isinstance(conversation, dict) or "mapping" not in conversation:
-                    continue
-
-                conversation_id = conversation.get("conversation_id")
-                base_timestamp = (
-                    _from_unix(conversation.get("create_time"))
-                    or (meta.response_time if meta is not None else None)
-                    or fallback_timestamp
+                author = message.get("author") if isinstance(message.get("author"), dict) else {}
+                content = message.get("content") if isinstance(message.get("content"), dict) else {}
+                message_metadata = (
+                    message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
                 )
-
+                text = _extract_text(content)
+                message_timestamp = _from_unix(message.get("create_time")) or base_timestamp
                 emit(
                     NormalizedEvent(
                         source_id=source.source_id,
                         parser_id=self.metadata.parser_id,
-                        timestamp=base_timestamp,
-                        event_type="chatgpt_conversation",
-                        path=cache_key.url,
+                        timestamp=message_timestamp,
+                        event_type="chatgpt_conversation_message",
+                        path=record.url,
                         service=_SERVICE_NAME,
                         session_id=conversation_id,
+                        actor=author.get("role"),
                         attribution=AgentAttribution.HIGH,
                         attribution_score=0.85,
                         attribution_reasons=("chatgpt_desktop_cache_conversation_json",),
-                        raw_reference=artifact.record_id,
+                        raw_reference=f"{artifact.record_id}:{record.raw_reference}",
                         metadata={
-                            "cache_key": key,
-                            "title": conversation.get("title"),
-                            "default_model_slug": conversation.get("default_model_slug"),
-                            "current_node": conversation.get("current_node"),
-                            "create_time": conversation.get("create_time"),
-                            "update_time": conversation.get("update_time"),
-                            "gizmo_id": conversation.get("gizmo_id"),
-                            "is_archived": conversation.get("is_archived"),
+                            "cache_key": record.key,
+                            "message_id": node_id,
+                            "parent_id": node.get("parent"),
+                            "author_role": author.get("role"),
+                            "author_name": author.get("name"),
+                            "channel": message.get("channel"),
+                            "recipient": message.get("recipient"),
+                            "status": message.get("status"),
+                            "end_turn": message.get("end_turn"),
+                            "content_type": content.get("content_type"),
+                            "text": text,
+                            "content": content if text is None else None,
+                            "model_slug": message_metadata.get("model_slug"),
+                            "finish_details": message_metadata.get("finish_details"),
                         },
                     )
                 )
-
-                for node_id, node, message in _iter_conversation_messages(conversation):
-                    if context.cancelled():
-                        return
-
-                    author = message.get("author") if isinstance(message.get("author"), dict) else {}
-                    content = message.get("content") if isinstance(message.get("content"), dict) else {}
-                    message_metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
-                    text = _extract_text(content)
-                    message_timestamp = _from_unix(message.get("create_time")) or base_timestamp
-
-                    emit(
-                        NormalizedEvent(
-                            source_id=source.source_id,
-                            parser_id=self.metadata.parser_id,
-                            timestamp=message_timestamp,
-                            event_type="chatgpt_conversation_message",
-                            path=cache_key.url,
-                            service=_SERVICE_NAME,
-                            session_id=conversation_id,
-                            actor=author.get("role"),
-                            attribution=AgentAttribution.HIGH,
-                            attribution_score=0.85,
-                            attribution_reasons=("chatgpt_desktop_cache_conversation_json",),
-                            raw_reference=artifact.record_id,
-                            metadata={
-                                "cache_key": key,
-                                "message_id": node_id,
-                                "parent_id": node.get("parent"),
-                                "author_role": author.get("role"),
-                                "author_name": author.get("name"),
-                                "channel": message.get("channel"),
-                                "recipient": message.get("recipient"),
-                                "status": message.get("status"),
-                                "end_turn": message.get("end_turn"),
-                                "content_type": content.get("content_type"),
-                                "text": text,
-                                "content": content if text is None else None,
-                                "model_slug": message_metadata.get("model_slug"),
-                                "finish_details": message_metadata.get("finish_details"),
-                            },
-                        )
-                    )

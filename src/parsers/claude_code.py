@@ -8,7 +8,7 @@ from version import __version__
 
 
 class ClaudeCodeParser(ArtifactParser):
-    """Example Claude Code parser wired into TraceAgent without real parsing yet."""
+    """Claude Code parser contract pending full artifact interpretation."""
 
     @property
     def metadata(self) -> ParserMetadata:
@@ -18,7 +18,7 @@ class ClaudeCodeParser(ArtifactParser):
             category="service",
             version=__version__,
             services=("Claude Code",),
-            description="Placeholder module for Claude Code JSONL session artifacts.",
+            description="Claude Code JSONL session parser pending full implementation.",
             implementation_status="placeholder",
         )
 
@@ -37,4 +37,4 @@ class ClaudeCodeParser(ArtifactParser):
         emit: EventSink,
         context: ParseContext,
     ) -> None:
-        context.progress(100, "Claude Code placeholder emitted no events.")
+        context.progress(100, "Claude Code parser is pending implementation; no events emitted.")

@@ -6,14 +6,12 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ccl_chromium_reader import ccl_chromium_cache
-
 from core.models import AgentAttribution, ArtifactRecord, EvidenceSource, NormalizedEvent
-from parsers._cache_utils import decode_body, try_parse_json
 from parsers.base import ArtifactParser, EventSink, ParseContext, ParserMetadata
+from utils.chromium_cache import ChromiumCacheParser, decode_body, try_parse_json
 from version import __version__
 
-_SERVICE_NAME = "Codex Desktop"
+_SERVICE_NAME = "Codex"
 
 _CACHE_GLOB = "**/Packages/OpenAI.Codex_*/LocalCache/Roaming/Codex/web/Codex/Default/Cache/Cache_Data"
 _CODEX_HOME_GLOB = "**/.codex"
@@ -108,6 +106,9 @@ def _json_safe(value: object) -> object:
 
 class CodexParser(ArtifactParser):
     """Parses Codex Desktop's Chromium cache, sqlite logs/threads, and session JSONL artifacts."""
+
+    def __init__(self, *, cache_parser: ChromiumCacheParser | None = None) -> None:
+        self._cache_parser = cache_parser or ChromiumCacheParser()
 
     @property
     def metadata(self) -> ParserMetadata:
@@ -228,41 +229,32 @@ class CodexParser(ArtifactParser):
     ) -> None:
         cache_dir = Path(artifact.path)
         fallback_timestamp = _mtime_fallback(cache_dir)
-        cache_class = ccl_chromium_cache.guess_cache_class(cache_dir) or ccl_chromium_cache.ChromiumSimpleFileCache
-
-        with cache_class(cache_dir) as cache:
-            for key in cache.keys():
-                if context.cancelled():
-                    return
-
-                cache_key = ccl_chromium_cache.CacheKey(key)
-                if "conversation" not in cache_key.url.lower():
-                    continue
-
-                meta = next(iter(cache.get_metadata(key)), None)
-                body = next(iter(cache.get_cachefile(key)), b"")
-                encoding = (meta.get_attribute("content-encoding") or [""])[0] if meta is not None else ""
-                conversation = try_parse_json(decode_body(body, encoding))
-                if conversation is None:
-                    continue
-
-                timestamp = (meta.response_time if meta is not None else None) or fallback_timestamp
-
-                emit(
-                    NormalizedEvent(
-                        source_id=source.source_id,
-                        parser_id=self.metadata.parser_id,
-                        timestamp=timestamp,
-                        event_type="codex_cache_conversation",
-                        path=cache_key.url,
-                        service=_SERVICE_NAME,
-                        attribution=AgentAttribution.HIGH,
-                        attribution_score=0.8,
-                        attribution_reasons=("codex_desktop_cache_conversation_url",),
-                        raw_reference=artifact.record_id,
-                        metadata={"cache_key": key, "conversation": conversation},
-                    )
+        result = self._cache_parser.parse(
+            cache_dir,
+            include_body=True,
+            cancelled=context.cancelled,
+        )
+        for record in result.records:
+            if "conversation" not in record.url.lower():
+                continue
+            conversation = try_parse_json(decode_body(record.body, record.content_encoding))
+            if conversation is None:
+                continue
+            emit(
+                NormalizedEvent(
+                    source_id=source.source_id,
+                    parser_id=self.metadata.parser_id,
+                    timestamp=record.response_time or fallback_timestamp,
+                    event_type="codex_cache_conversation",
+                    path=record.url,
+                    service=_SERVICE_NAME,
+                    attribution=AgentAttribution.HIGH,
+                    attribution_score=0.8,
+                    attribution_reasons=("codex_desktop_cache_conversation_url",),
+                    raw_reference=f"{artifact.record_id}:{record.raw_reference}",
+                    metadata={"cache_key": record.key, "conversation": conversation},
                 )
+            )
 
     def _parse_sqlite_table(
         self,

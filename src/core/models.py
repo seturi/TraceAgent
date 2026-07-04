@@ -41,6 +41,8 @@ class ArtifactRecord:
     service: str | None = None
     sha256: str | None = None
     size: int | None = None
+    original_path: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
     record_id: str = field(default_factory=lambda: str(uuid4()))
 
 

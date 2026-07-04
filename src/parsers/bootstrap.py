@@ -1,9 +1,12 @@
 from parsers.chatgpt import ChatGPTParser
 from parsers.claude_code import ClaudeCodeParser
+from parsers.claude_cowork import ClaudeCoworkParser
 from parsers.codex import CodexParser
 from parsers.registry import ParserRegistry
 
 
 def create_default_parser_registry() -> ParserRegistry:
     """Create the parser set exposed by the desktop application."""
-    return ParserRegistry((ClaudeCodeParser(), ChatGPTParser(), CodexParser()))
+    return ParserRegistry(
+        (ClaudeCodeParser(), ClaudeCoworkParser(), ChatGPTParser(), CodexParser())
+    )
