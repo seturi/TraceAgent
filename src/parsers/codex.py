@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from collections.abc import Iterable
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from core.models import AgentAttribution, ArtifactRecord, EvidenceSource, NormalizedEvent
 from parsers.base import ArtifactParser, EventSink, ParseContext, ParserMetadata
+from utils.structured_data import file_timestamp, iter_sqlite_rows, parse_timestamp
 from version import __version__
 
 _SERVICE_NAME = "Codex"
@@ -47,19 +47,6 @@ def _find_codex_homes(location: Path) -> tuple[Path, ...]:
     return tuple(sorted(homes))
 
 
-def _mtime_fallback(path: Path) -> datetime:
-    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-
-
-def _parse_iso(value: object) -> datetime | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
 def _sanitize_payload(payload: dict) -> dict:
     sanitized = dict(payload)
     encrypted_content = sanitized.pop("encrypted_content", None)
@@ -97,33 +84,16 @@ def _derive_actor(record_type: str, payload: dict) -> str | None:
     return None
 
 
-def _guess_timestamp_column(columns: list[str]) -> str | None:
-    lowered = {column.lower(): column for column in columns}
+def _row_timestamp(values: dict[str, object]) -> datetime | None:
+    lowered = {key.lower(): key for key in values}
     for candidate in _TIMESTAMP_COLUMN_CANDIDATES:
-        if candidate in lowered:
-            return lowered[candidate]
+        key = lowered.get(candidate)
+        if key is None:
+            continue
+        timestamp = parse_timestamp(values[key])
+        if timestamp is not None:
+            return timestamp
     return None
-
-
-def _coerce_timestamp(value: object) -> datetime | None:
-    if isinstance(value, (int, float)):
-        seconds = value / 1000 if value > 10**12 else value
-        try:
-            return datetime.fromtimestamp(seconds, tz=timezone.utc)
-        except (OverflowError, OSError, ValueError):
-            return None
-    if isinstance(value, str):
-        return _parse_iso(value)
-    return None
-
-
-def _json_safe(value: object) -> object:
-    if isinstance(value, bytes):
-        try:
-            return value.decode("utf-8")
-        except UnicodeDecodeError:
-            return value.hex()
-    return value
 
 
 class CodexParser(ArtifactParser):
@@ -268,49 +238,36 @@ class CodexParser(ArtifactParser):
         context: ParseContext,
     ) -> None:
         db_path = Path(artifact.path)
-        fallback_timestamp = _mtime_fallback(db_path)
+        fallback_timestamp = file_timestamp(db_path)
 
-        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        try:
-            connection.row_factory = sqlite3.Row
-            cursor = connection.execute(f"SELECT * FROM {table_name}")
-            columns = [description[0] for description in cursor.description]
-            timestamp_column = _guess_timestamp_column(columns)
+        for row in iter_sqlite_rows(db_path, tables=(table_name,)):
+            if context.cancelled():
+                return
 
-            for row in cursor:
-                if context.cancelled():
-                    return
+            timestamp = _row_timestamp(row.values) or fallback_timestamp
+            session_id = row.values.get("id") if table_name == "threads" else None
 
-                row_dict = {column: _json_safe(row[column]) for column in columns}
-                timestamp = None
-                if timestamp_column is not None:
-                    timestamp = _coerce_timestamp(row_dict.get(timestamp_column))
-                timestamp = timestamp or fallback_timestamp
-                session_id = row_dict.get("id") if table_name == "threads" else None
-
-                emit(
-                    NormalizedEvent(
-                        source_id=source.source_id,
-                        parser_id=self.metadata.parser_id,
-                        timestamp=timestamp,
-                        event_type=f"codex_{table_name}_record",
-                        service=_SERVICE_NAME,
-                        session_id=session_id,
-                        attribution=AgentAttribution.HIGH,
-                        attribution_score=0.8,
-                        attribution_reasons=(f"codex_desktop_{table_name}_table",),
-                        raw_reference=artifact.record_id,
-                        metadata=row_dict,
-                    )
+            emit(
+                NormalizedEvent(
+                    source_id=source.source_id,
+                    parser_id=self.metadata.parser_id,
+                    timestamp=timestamp,
+                    event_type=f"codex_{table_name}_record",
+                    service=_SERVICE_NAME,
+                    session_id=session_id,
+                    attribution=AgentAttribution.HIGH,
+                    attribution_score=0.8,
+                    attribution_reasons=(f"codex_desktop_{table_name}_table",),
+                    raw_reference=f"{artifact.record_id}:table={row.table}:row={row.row_number}",
+                    metadata=row.values,
                 )
-        finally:
-            connection.close()
+            )
 
     def _parse_session_jsonl(
         self, source: EvidenceSource, artifact: ArtifactRecord, emit: EventSink, context: ParseContext
     ) -> None:
         session_path = Path(artifact.path)
-        fallback_timestamp = _mtime_fallback(session_path)
+        fallback_timestamp = file_timestamp(session_path)
         current_session_id: str | None = None
 
         with session_path.open("r", encoding="utf-8") as handle:
@@ -336,7 +293,7 @@ class CodexParser(ArtifactParser):
 
                 sub_type = payload.get("type") if record_type in ("event_msg", "response_item") else None
                 event_type = f"codex_{record_type}.{sub_type}" if sub_type else f"codex_{record_type}"
-                timestamp = _parse_iso(record.get("timestamp")) or fallback_timestamp
+                timestamp = parse_timestamp(record.get("timestamp")) or fallback_timestamp
 
                 emit(
                     NormalizedEvent(
@@ -359,7 +316,7 @@ class CodexParser(ArtifactParser):
         self, source: EvidenceSource, artifact: ArtifactRecord, emit: EventSink, context: ParseContext
     ) -> None:
         path = Path(artifact.path)
-        fallback = _mtime_fallback(path)
+        fallback = file_timestamp(path)
         with path.open("r", encoding="utf-8", errors="replace") as stream:
             for line_number, line in enumerate(stream, start=1):
                 if context.cancelled():
@@ -374,7 +331,7 @@ class CodexParser(ArtifactParser):
                     NormalizedEvent(
                         source_id=source.source_id,
                         parser_id=self.metadata.parser_id,
-                        timestamp=_coerce_timestamp(record.get("ts")) or fallback,
+                        timestamp=parse_timestamp(record.get("ts")) or fallback,
                         event_type="codex_history_entry",
                         service=_SERVICE_NAME,
                         session_id=record.get("session_id"),
