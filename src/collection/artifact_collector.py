@@ -119,6 +119,62 @@ class ServiceArtifactCollector(Collector):
         if not pending:
             context.progress(100, "No supported service artifacts found.")
 
+    def inventory(
+        self,
+        source: EvidenceSource,
+        context: CollectionContext,
+    ) -> Iterable[ArtifactRecord]:
+        """Register extracted artifacts in place without copying them."""
+        errors: list[dict[str, str]] = []
+        with open_evidence_accessor(source) as accessor:
+            detections = detect_service_artifacts(accessor)
+            context.options["service_detections"] = detections
+            pending = self._pending_files(accessor, detections)
+            for index, (root, entry) in enumerate(pending, start=1):
+                if context.cancelled():
+                    break
+                try:
+                    digest = (
+                        self._hash_entry(accessor, entry)
+                        if context.calculate_sha256
+                        else None
+                    )
+                    yield ArtifactRecord(
+                        source_id=source.source_id,
+                        producer_id=self.metadata.collector_id,
+                        path=entry.path,
+                        artifact_type=root.artifact_type,
+                        service=root.service,
+                        sha256=digest,
+                        size=entry.size,
+                        original_path=entry.path,
+                        metadata={
+                            "user": root.user.name,
+                            "user_home": root.user.display_path,
+                            "detected_root": root.entry.path,
+                            "source_kind": source.kind.value,
+                            "modified_time": entry.modified_time,
+                            "referenced_in_place": True,
+                        },
+                    )
+                except Exception as exc:
+                    errors.append({"path": entry.path, "error": str(exc)})
+                context.progress(
+                    round(index / max(len(pending), 1) * 100),
+                    f"Registering {root.service}: {entry.name}",
+                )
+        context.options["collection_errors"] = errors
+        if not pending:
+            context.progress(100, "No supported service artifacts found.")
+
+    @staticmethod
+    def _hash_entry(accessor: EvidenceAccessor, entry: EvidenceEntry) -> str:
+        digest = hashlib.sha256()
+        with accessor.open_binary(entry) as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+
     @staticmethod
     def _write_manifests(
         output_root: Path,
@@ -226,12 +282,15 @@ def _safe_component(value: str) -> str:
 
 def _prefixed_filename(artifact_type: str, filename: str) -> str:
     safe_name = _safe_component(filename)
-    return f"{_safe_component(artifact_type)}__{safe_name}"
+    prefix = f"{_safe_component(artifact_type)}__"
+    return safe_name if safe_name.lower().startswith(prefix.lower()) else f"{prefix}{safe_name}"
 
 
 def _compound_group_name(artifact_type: str, root_name: str, group_hash: str) -> str:
     safe_type = _safe_component(artifact_type)
     safe_name = _safe_component(root_name)
+    if safe_name.lower().startswith(f"{safe_type.lower()}__"):
+        return safe_name
     indexeddb_suffix = ".indexeddb.leveldb"
     if safe_name.lower().endswith(indexeddb_suffix):
         stem = safe_name[: -len(indexeddb_suffix)]

@@ -23,7 +23,7 @@ from utils.structured_data import file_timestamp
 from version import __version__
 
 _LOG_PARSER_ID = "ntfs.logfile"
-_LOG_GLOB = "**/ntfs_logfile__*.bin"
+_LOG_GLOBS = ("**/ntfs_logfile__*.bin", "**/$LogFile")
 
 
 class NtfsLogFileParser(ArtifactParser):
@@ -88,7 +88,9 @@ class NtfsLogFileParser(ArtifactParser):
     @staticmethod
     def _logs(location: Path) -> Iterable[tuple[Path, Path | None]]:
         try:
-            logs = sorted(location.glob(_LOG_GLOB))
+            logs = sorted(
+                {path for pattern in _LOG_GLOBS for path in location.glob(pattern)}
+            )
         except OSError:
             return
         for log in logs:
@@ -98,9 +100,10 @@ class NtfsLogFileParser(ArtifactParser):
 
 
 def _sibling_mft(log: Path) -> Path | None:
-    for candidate in log.parent.glob("ntfs_mft__*.bin"):
-        if candidate.is_file():
-            return candidate
+    for pattern in ("ntfs_mft__*.bin", "$MFT"):
+        for candidate in log.parent.glob(pattern):
+            if candidate.is_file():
+                return candidate
     return None
 
 
