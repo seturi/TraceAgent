@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 
 from core.models import SourceKind
 from utils.evidence_access import EvidenceAccessor, EvidenceEntry, EvidenceUserHome
@@ -44,6 +46,8 @@ SERVICE_NAMES = (
     "Antigravity",
     "Codex",
 )
+
+_COMPOUND_ARTIFACT_TYPES = {"indexeddb", "local_storage", "cache_data"}
 
 
 SERVICE_ARTIFACT_SPECS = (
@@ -219,7 +223,111 @@ def detect_service_artifacts(accessor: EvidenceAccessor) -> tuple[ServiceDetecti
                         )
                     )
 
+    # A previously collected TraceAgent artifacts directory uses compact file
+    # names instead of the original application paths. Recover its service and
+    # artifact-type mapping from the collection manifests so it can be loaded as
+    # an evidence source, collected into a new case, and parsed normally.
+    if accessor.source.kind == SourceKind.ARTIFACT_DIRECTORY:
+        for root in _manifest_artifact_roots(accessor):
+            identity = (root.service, root.artifact_type, root.entry.path.lower())
+            if identity in seen:
+                continue
+            seen.add(identity)
+            roots_by_service[root.service].append(root)
+
     return tuple(
         ServiceDetection(service, bool(roots_by_service[service]), tuple(roots_by_service[service]))
         for service in SERVICE_NAMES
+    )
+
+
+def _manifest_artifact_roots(accessor: EvidenceAccessor) -> tuple[DetectedArtifactRoot, ...]:
+    source_root = accessor.source.location
+    homes = accessor.user_homes()
+    if not homes or not source_root.is_dir():
+        return ()
+    home = homes[0]
+    roots: list[DetectedArtifactRoot] = []
+    seen: set[tuple[str, str, Path]] = set()
+
+    try:
+        manifests = tuple(source_root.rglob("collection_manifest.jsonl"))
+    except OSError:
+        return ()
+
+    for manifest in manifests:
+        if not manifest.is_file() or manifest.is_symlink():
+            continue
+        try:
+            lines = manifest.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(item, dict):
+                continue
+            service = item.get("service")
+            artifact_type = item.get("artifact_type")
+            collected_path = item.get("collected_path")
+            if (
+                service not in SERVICE_NAMES
+                or not isinstance(artifact_type, str)
+                or not isinstance(collected_path, str)
+            ):
+                continue
+            relative = PurePosixPath(collected_path.replace("\\", "/"))
+            if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+                continue
+            parts = relative.parts
+            service_relative = parts[1:] if parts[0].lower() == manifest.parent.name.lower() else parts
+            if not service_relative:
+                continue
+            if artifact_type in _COMPOUND_ARTIFACT_TYPES:
+                candidate = manifest.parent / service_relative[0]
+            else:
+                candidate = manifest.parent.joinpath(*service_relative)
+            entry = _local_entry_within(candidate, source_root)
+            if entry is None:
+                continue
+            identity = (service, artifact_type, candidate.resolve())
+            if identity in seen:
+                continue
+            seen.add(identity)
+            roots.append(
+                DetectedArtifactRoot(
+                    service=service,
+                    artifact_type=artifact_type,
+                    user=home,
+                    entry=entry,
+                    include_file_patterns=("**/*", "*"),
+                )
+            )
+    return tuple(roots)
+
+
+def _local_entry_within(path: Path, source_root: Path) -> EvidenceEntry | None:
+    try:
+        if path.is_symlink():
+            return None
+        resolved = path.resolve()
+        if not resolved.is_relative_to(source_root.resolve()):
+            return None
+        stat = resolved.stat()
+        is_file = resolved.is_file()
+        is_dir = resolved.is_dir()
+    except OSError:
+        return None
+    if not (is_file or is_dir):
+        return None
+    return EvidenceEntry(
+        path=str(resolved),
+        name=resolved.name,
+        is_file=is_file,
+        is_dir=is_dir,
+        size=stat.st_size if is_file else None,
+        modified_time=stat.st_mtime,
+        handle=resolved,
     )

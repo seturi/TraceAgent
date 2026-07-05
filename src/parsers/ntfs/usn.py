@@ -25,7 +25,7 @@ from parsers.base import ArtifactParser, EventSink, ParseContext, ParserMetadata
 from utils.structured_data import file_timestamp
 from version import __version__
 
-_USN_GLOB = "**/ntfs_usnjrnl__*.bin"
+_USN_GLOBS = ("**/ntfs_usnjrnl__*.bin", "**/$J")
 
 
 class NtfsUsnParser(ArtifactParser):
@@ -90,7 +90,9 @@ class NtfsUsnParser(ArtifactParser):
     @staticmethod
     def _journals(location: Path) -> Iterable[tuple[Path, Path | None]]:
         try:
-            journals = sorted(location.glob(_USN_GLOB))
+            journals = sorted(
+                {path for pattern in _USN_GLOBS for path in location.glob(pattern)}
+            )
         except OSError:
             return
         for journal in journals:
@@ -101,9 +103,10 @@ class NtfsUsnParser(ArtifactParser):
 
 
 def _sibling_mft(journal: Path) -> Path | None:
-    for candidate in journal.parent.glob("ntfs_mft__*.bin"):
-        if candidate.is_file():
-            return candidate
+    for pattern in ("ntfs_mft__*.bin", "$MFT"):
+        for candidate in journal.parent.glob(pattern):
+            if candidate.is_file():
+                return candidate
     return None
 
 

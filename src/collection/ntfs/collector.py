@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 from collection.base import CollectionContext, Collector, CollectorMetadata
@@ -24,23 +25,59 @@ _USN_NAME = "ntfs_usnjrnl"
 _LOG_NAME = "ntfs_logfile"
 
 
+@dataclass(frozen=True, slots=True)
+class ExtractedNtfsArtifacts:
+    """NTFS metadata files extracted from one volume into a directory."""
+
+    directory: Path
+    volume: str
+    mft: Path | None = None
+    usn: Path | None = None
+    logfile: Path | None = None
+
+    @property
+    def files(self) -> tuple[tuple[str, str, Path], ...]:
+        values = (
+            (_MFT_NAME, "$MFT", self.mft),
+            (_USN_NAME, "$J", self.usn),
+            (_LOG_NAME, "$LogFile", self.logfile),
+        )
+        return tuple((kind, name, path) for kind, name, path in values if path is not None)
+
+
 class NtfsArtifactCollector(Collector):
-    """Copy $MFT and $UsnJrnl:$J from every NTFS volume, read-only."""
+    """Copy NTFS metadata from a volume or extracted folder, read-only."""
 
     @property
     def metadata(self) -> CollectorMetadata:
         return CollectorMetadata(
             collector_id="ntfs_filesystem",
             name="NTFS filesystem journals",
-            source_kinds=(SourceKind.LIVE_SYSTEM, SourceKind.DISK_IMAGE),
-            description="Copy $MFT and $UsnJrnl:$J from NTFS volumes for USN event analysis.",
+            source_kinds=(
+                SourceKind.LIVE_SYSTEM,
+                SourceKind.DISK_IMAGE,
+                SourceKind.ARTIFACT_DIRECTORY,
+            ),
+            description=(
+                "Collect $MFT, $UsnJrnl:$J and $LogFile from NTFS volumes, or "
+                "reference them directly from an extracted artifact folder."
+            ),
         )
+
+    def scan(self, source: EvidenceSource) -> tuple[ExtractedNtfsArtifacts, ...]:
+        if source.kind != SourceKind.ARTIFACT_DIRECTORY or not source.location.is_dir():
+            return ()
+        return _find_extracted_artifacts(source.location)
 
     def collect(
         self, source: EvidenceSource, context: CollectionContext
     ) -> Iterable[ArtifactRecord]:
         if source.kind not in self.metadata.source_kinds:
-            context.progress(100, "NTFS collection needs a live system or disk image.")
+            context.progress(100, "Unsupported source type for NTFS collection.")
+            return
+
+        if source.kind == SourceKind.ARTIFACT_DIRECTORY:
+            yield from self._collect_extracted(source, context)
             return
 
         output_root = context.workspace / "artifacts" / "NTFS"
@@ -99,6 +136,48 @@ class NtfsArtifactCollector(Collector):
         finally:
             context.options["ntfs_collection_errors"] = errors
             _close_target(target)
+
+    def _collect_extracted(
+        self, source: EvidenceSource, context: CollectionContext
+    ) -> Iterable[ArtifactRecord]:
+        sets = self.scan(source)
+        errors: list[dict[str, str]] = []
+        pending = [(item, artifact) for item in sets for artifact in item.files]
+
+        for index, (item, (artifact_type, original_name, source_path)) in enumerate(
+            pending, start=1
+        ):
+            if context.cancelled():
+                break
+            try:
+                stat = source_path.stat()
+                digest = _hash_file(source_path) if context.calculate_sha256 else None
+                yield ArtifactRecord(
+                    source_id=source.source_id,
+                    producer_id=self.metadata.collector_id,
+                    path=str(source_path),
+                    artifact_type=artifact_type,
+                    service="NTFS",
+                    sha256=digest,
+                    size=stat.st_size,
+                    original_path=str(source_path),
+                    metadata={
+                        "volume": item.volume,
+                        "source_kind": source.kind.value,
+                        "original_name": original_name,
+                        "referenced_in_place": True,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                errors.append({"path": str(source_path), "error": str(exc)})
+            context.progress(
+                round(index / max(len(pending), 1) * 100),
+                f"Registering extracted NTFS artifact: {source_path.name}",
+            )
+
+        context.options["ntfs_collection_errors"] = errors
+        if not pending:
+            context.progress(100, "No extracted NTFS artifacts found.")
 
 
 def _open_target(source: EvidenceSource):
@@ -201,6 +280,62 @@ def _close_target(target) -> None:
                     close()
                 except Exception:  # noqa: BLE001
                     pass
+
+
+def _find_extracted_artifacts(root: Path) -> tuple[ExtractedNtfsArtifacts, ...]:
+    grouped: dict[Path, dict[str, Path]] = {}
+    try:
+        candidates = root.rglob("*")
+        for path in candidates:
+            try:
+                if not path.is_file() or path.is_symlink():
+                    continue
+            except OSError:
+                continue
+            artifact_type = _artifact_type_for_name(path.name)
+            if artifact_type is not None:
+                grouped.setdefault(path.parent, {}).setdefault(artifact_type, path)
+    except OSError:
+        return ()
+
+    results: list[ExtractedNtfsArtifacts] = []
+    for directory, files in sorted(grouped.items(), key=lambda item: str(item[0]).lower()):
+        # $MFT alone cannot produce a timeline. Keep sets that have at least one
+        # journal that an NTFS parser can consume.
+        if _USN_NAME not in files and _LOG_NAME not in files:
+            continue
+        volume = directory.name if directory != root else root.name
+        results.append(
+            ExtractedNtfsArtifacts(
+                directory=directory,
+                volume=_safe(volume),
+                mft=files.get(_MFT_NAME),
+                usn=files.get(_USN_NAME),
+                logfile=files.get(_LOG_NAME),
+            )
+        )
+    return tuple(results)
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(_CHUNK):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _artifact_type_for_name(name: str) -> str | None:
+    lowered = name.lower()
+    if lowered == "$mft" or (lowered.startswith(f"{_MFT_NAME}__") and lowered.endswith(".bin")):
+        return _MFT_NAME
+    if lowered == "$j" or (lowered.startswith(f"{_USN_NAME}__") and lowered.endswith(".bin")):
+        return _USN_NAME
+    if lowered == "$logfile" or (lowered.startswith(f"{_LOG_NAME}__") and lowered.endswith(".bin")):
+        return _LOG_NAME
+    return None
+
+
 
 
 def _safe(value: str) -> str:

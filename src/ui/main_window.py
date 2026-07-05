@@ -41,7 +41,7 @@ from analysis.ntfs.attribution import OperationVerdict, attribute_ntfs_events
 from analysis.ntfs.signatures import basename_of, normalize_path
 from collection.artifact_collector import ServiceArtifactCollector
 from collection.base import CollectionContext
-from collection.ntfs.collector import NtfsArtifactCollector
+from collection.ntfs.collector import ExtractedNtfsArtifacts, NtfsArtifactCollector
 from collection.service_catalog import ServiceDetection
 from core.models import (
     ActorClass,
@@ -100,6 +100,7 @@ class MainWindow(QMainWindow):
         self.ntfs_collector = NtfsArtifactCollector()
         self.ntfs_verdicts: tuple[OperationVerdict, ...] = ()
         self._ntfs_status = ""
+        self.ntfs_folder_artifacts: tuple[ExtractedNtfsArtifacts, ...] = ()
         self.current_source: EvidenceSource | None = None
         self.service_detections: tuple[ServiceDetection, ...] = ()
         self.collected_artifacts: tuple[ArtifactRecord, ...] = ()
@@ -467,7 +468,9 @@ class MainWindow(QMainWindow):
 
     def _source_kind_changed(self) -> None:
         live = self.source_kind.currentData() == "live_system"
+        extracted = self.source_kind.currentData() == "artifact_directory"
         self.browse_button.setEnabled(not live)
+        self.collect_button.setText("Use Artifact Folder" if extracted else "Start Collection")
         self.source_path.clear()
         self.source_path.setPlaceholderText("Local computer (live collection)" if live else "Select a source path")
 
@@ -500,9 +503,11 @@ class MainWindow(QMainWindow):
             with open_evidence_accessor(source) as accessor:
                 info = accessor.info()
                 detections = self.artifact_collector.scan(source, accessor)
+            ntfs_folder_artifacts = self.ntfs_collector.scan(source)
         except (SourceAccessError, OSError, ValueError) as exc:
             self.current_source = None
             self.service_detections = ()
+            self.ntfs_folder_artifacts = ()
             self.collection_table.setRowCount(0)
             self._update_parse_service_states()
             QMessageBox.critical(self, "Evidence Source", str(exc))
@@ -512,14 +517,16 @@ class MainWindow(QMainWindow):
             self.load_button.setEnabled(True)
 
         self.current_source = source
-        self._update_ntfs_lock(source.kind)
         self.service_detections = detections
+        self.ntfs_folder_artifacts = ntfs_folder_artifacts
+        self._update_ntfs_lock(source.kind)
         self.collected_artifacts = ()
         self.collection_root = None
         self.parsed_events = ()
         self.case_paths = None
         self._ntfs_status = ""
         self._show_service_detections(detections)
+        self._show_ntfs_folder_detection(ntfs_folder_artifacts)
         self._update_parse_service_states()
         present_count = sum(detection.present for detection in detections)
         fs_text = f", {info.filesystems} filesystem(s)" if info.filesystems is not None else ""
@@ -538,7 +545,9 @@ class MainWindow(QMainWindow):
             + (" — NTFS needs Administrator" if needs_admin else "")
         )
         self.collect_button.setEnabled(
-            present_count > 0 or source.kind in self.ntfs_collector.metadata.source_kinds
+            present_count > 0
+            or source.kind in {SourceKind.LIVE_SYSTEM, SourceKind.DISK_IMAGE}
+            or bool(ntfs_folder_artifacts)
         )
         self.tabs.setCurrentIndex(0)
 
@@ -550,6 +559,22 @@ class MainWindow(QMainWindow):
             status = f"Found ({len(roots)})" if detection.present else "Not found"
             self._append_collection_row(
                 (detection.service, "Service detection", path, "", "", status)
+            )
+
+    def _show_ntfs_folder_detection(
+        self, artifacts: tuple[ExtractedNtfsArtifacts, ...]
+    ) -> None:
+        for item in artifacts:
+            names = ", ".join(path.name for _kind, _name, path in item.files)
+            self._append_collection_row(
+                (
+                    "NTFS",
+                    "Extracted filesystem artifacts",
+                    str(item.directory),
+                    "",
+                    "",
+                    f"Found ({names})",
+                )
             )
 
     def _update_parse_service_states(self) -> None:
@@ -621,7 +646,10 @@ class MainWindow(QMainWindow):
                 context.options["ntfs_collection_errors"] = ntfs_context.options.get(
                     "ntfs_collection_errors", []
                 )
-            records.extend(self.artifact_collector.collect(self.current_source, context))
+            if self.current_source.kind == SourceKind.ARTIFACT_DIRECTORY:
+                records.extend(self.artifact_collector.inventory(self.current_source, context))
+            else:
+                records.extend(self.artifact_collector.collect(self.current_source, context))
             records = tuple(records)
         except (SourceAccessError, OSError, ValueError) as exc:
             QMessageBox.critical(self, "Collection", str(exc))
@@ -631,11 +659,16 @@ class MainWindow(QMainWindow):
             self.load_button.setEnabled(True)
             self.collect_button.setEnabled(
                 any(item.present for item in self.service_detections)
-                or self.current_source.kind in self.ntfs_collector.metadata.source_kinds
+                or self.current_source.kind in {SourceKind.LIVE_SYSTEM, SourceKind.DISK_IMAGE}
+                or bool(self.ntfs_folder_artifacts)
             )
 
         self.collected_artifacts = records
-        self.collection_root = self.case_paths.artifacts
+        self.collection_root = (
+            self.current_source.location
+            if self.current_source.kind == SourceKind.ARTIFACT_DIRECTORY
+            else self.case_paths.artifacts
+        )
         self._update_parse_service_states()
         for record in records:
             self._append_collection_row(
@@ -645,15 +678,24 @@ class MainWindow(QMainWindow):
                     record.path,
                     _format_size(record.size),
                     record.sha256 or "Not calculated",
-                    "Collected",
+                    (
+                        "Referenced"
+                        if self.current_source.kind == SourceKind.ARTIFACT_DIRECTORY
+                        else "Collected"
+                    ),
                 )
             )
         errors = context.options.get("collection_errors", [])
         self._record_ntfs_collection_status(records, context)
         self.collection_progress.setValue(100)
         self.parse_button.setEnabled(bool(records) and bool(self.parser_registry.all()))
+        action = (
+            "Registered"
+            if self.current_source.kind == SourceKind.ARTIFACT_DIRECTORY
+            else "Collected"
+        )
         self.statusBar().showMessage(
-            f"Collected {len(records)} artifact file(s); {len(errors)} error(s) — "
+            f"{action} {len(records)} artifact file(s); {len(errors)} error(s) — "
             f"{self.case_paths.root}"
         )
         self.tabs.setCurrentIndex(1)
@@ -666,10 +708,12 @@ class MainWindow(QMainWindow):
         ntfs_errors = context.options.get("ntfs_collection_errors", []) or []
         if self.current_source is None:
             return
-        if self.current_source.kind not in self.ntfs_collector.metadata.source_kinds:
+        if (
+            self.current_source.kind == SourceKind.ARTIFACT_DIRECTORY
+            and not self.ntfs_folder_artifacts
+        ):
             self._ntfs_status = (
-                "NTFS events require a live-system or disk-image source. The current "
-                "source is an extracted artifact directory, which has no $MFT/$UsnJrnl."
+                "No $J/$LogFile artifacts were detected in the selected artifact folder."
             )
         elif ntfs_collected == 0:
             reason = str(ntfs_errors[0].get("error")) if ntfs_errors else "no NTFS volume was found"
@@ -818,8 +862,19 @@ class MainWindow(QMainWindow):
             f"Parsing complete: {len(self.parsed_events)} normalized event(s) — "
             f"{self.case_paths.parsed}"
         )
-        if self.parsed_events:
-            self.tabs.setCurrentIndex(2)
+        has_local_events = any(
+            not event.parser_id.startswith("ntfs.") for event in self.parsed_events
+        )
+        has_ntfs_events = any(
+            event.parser_id.startswith("ntfs.") for event in self.parsed_events
+        )
+        if (has_ntfs_events and not has_local_events) or (
+            not self.parsed_events and bool(self.ntfs_folder_artifacts)
+        ):
+            self.analyze_tabs.setCurrentIndex(1)
+        else:
+            self.analyze_tabs.setCurrentIndex(0)
+        self.tabs.setCurrentIndex(2)
 
     def _parse_progress(self, parser_name: str, message: str) -> None:
         self.statusBar().showMessage(f"{parser_name}: {message}")
@@ -937,7 +992,7 @@ class MainWindow(QMainWindow):
             for key, entry in entries:
                 session_id = entry["session_id"]
                 short = session_id if len(session_id) <= 18 else f"{session_id[:8]}…{session_id[-4:]}"
-                when = entry["first"].astimezone().strftime("%m-%d %H:%M")
+                when = _format_local_datetime(entry["first"], "%m-%d %H:%M")
                 child = QTreeWidgetItem((f"{when}  {short}", str(len(entry["events"]))))
                 child.setToolTip(0, session_id)
                 child.setData(0, Qt.UserRole, key)
@@ -985,8 +1040,8 @@ class MainWindow(QMainWindow):
         self.la_chat.setHtml(_chat_document(shown))
         self.la_session_label.setText(
             f"Session {entry['session_id']}  ·  {entry['service']}  ·  "
-            f"{entry['first'].astimezone().strftime('%Y-%m-%d %H:%M')}–"
-            f"{entry['last'].astimezone().strftime('%H:%M:%S')}  ·  "
+            f"{_format_local_datetime(entry['first'], '%Y-%m-%d %H:%M')}–"
+            f"{_format_local_datetime(entry['last'], '%H:%M:%S')}  ·  "
             f"{len(shown)}/{len(entry['events'])} shown"
         )
 
@@ -1001,7 +1056,7 @@ class MainWindow(QMainWindow):
         icon, kind = _event_kind(event)
         lines = [
             f"{icon} {kind.upper()}",
-            f"Timestamp : {event.timestamp.astimezone().isoformat()}",
+            f"Timestamp : {_format_local_datetime(event.timestamp)}",
             f"Service   : {event.service or '—'}",
             f"Session   : {event.session_id or '—'}",
             f"Actor     : {event.actor or '—'}",
@@ -1062,7 +1117,7 @@ class MainWindow(QMainWindow):
             _actor_class_label(entry["actor"], entry["service"]),
             entry["service"] or "—",
             str(len(entry["ops"]) + len(entry["logs"])),
-            last.astimezone().strftime("%Y-%m-%d %H:%M:%S") if last else "—",
+            _format_local_datetime(last, "%Y-%m-%d %H:%M:%S") if last else "—",
         )
         for column, value in enumerate(values):
             item = QTableWidgetItem(str(value))
@@ -1095,7 +1150,7 @@ class MainWindow(QMainWindow):
             lines.append("  (no USN operations — recovered from $LogFile only)")
         for verdict in ops:
             lines.append(
-                f"{verdict.start.astimezone().strftime('%Y-%m-%d %H:%M:%S')}  "
+                f"{_format_local_datetime(verdict.start, '%Y-%m-%d %H:%M:%S')}  "
                 f"[{_actor_class_label(verdict.actor_class, verdict.service)}]  {verdict.behavior}"
             )
             flow = self._operation_flow(verdict)
@@ -1253,7 +1308,7 @@ def _chat_document(events: list[NormalizedEvent] | tuple[NormalizedEvent, ...]) 
     parts = ["<html><body style=\"font-family:'Segoe UI',sans-serif;\">"]
     last_day = None
     for event in events:
-        day = event.timestamp.astimezone().strftime("%Y-%m-%d")
+        day = _format_local_datetime(event.timestamp, "%Y-%m-%d")
         if day != last_day:
             parts.append(
                 f'<div style="text-align:center;color:#9aa0a6;font-size:11px;'
@@ -1267,7 +1322,7 @@ def _chat_document(events: list[NormalizedEvent] | tuple[NormalizedEvent, ...]) 
 
 def _chat_bubble(event: NormalizedEvent) -> str:
     _, kind = _event_kind(event)
-    stamp = event.timestamp.astimezone().strftime("%H:%M:%S")
+    stamp = _format_local_datetime(event.timestamp, "%H:%M:%S")
     label, align, background = _BUBBLE_STYLE.get(kind, _BUBBLE_STYLE["event"])
     if kind == "tool" and event.tool_name:
         label = f"🔧 {html.escape(event.tool_name)}"
@@ -1366,6 +1421,20 @@ def _verdict_summary(verdicts: tuple[OperationVerdict, ...]) -> str:
     for verdict in verdicts:
         counts[verdict.actor_class.value] = counts.get(verdict.actor_class.value, 0) + 1
     return ", ".join(f"{name}={count}" for name, count in sorted(counts.items()))
+
+
+def _format_local_datetime(value: datetime, fmt: str | None = None) -> str:
+    """Format evidence time without letting an OS timezone limit crash the UI."""
+    try:
+        local_value = value.astimezone()
+        return local_value.strftime(fmt) if fmt else local_value.isoformat()
+    except (OSError, OverflowError, ValueError):
+        try:
+            utc_value = value.astimezone(timezone.utc)
+            rendered = utc_value.strftime(fmt) if fmt else utc_value.isoformat()
+            return f"{rendered} UTC" if fmt else rendered
+        except (OSError, OverflowError, ValueError):
+            return value.isoformat()
 
 
 def _format_size(size: int | None) -> str:
