@@ -22,6 +22,15 @@ class AgentAttribution(StrEnum):
     NONE = "none"
 
 
+class ActorClass(StrEnum):
+    """Who performed a file-system action, as decided by NTFS-log analysis."""
+
+    AI_AGENT = "ai_agent"
+    HUMAN = "human"
+    SYSTEM = "system"
+    UNKNOWN = "unknown"
+
+
 @dataclass(frozen=True, slots=True)
 class EvidenceSource:
     kind: SourceKind
@@ -62,6 +71,7 @@ class NormalizedEvent:
     attribution: AgentAttribution = AgentAttribution.NONE
     attribution_score: float = 0.0
     attribution_reasons: tuple[str, ...] = ()
+    actor_class: ActorClass = ActorClass.UNKNOWN
     raw_reference: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     event_id: str = field(default_factory=lambda: str(uuid4()))

@@ -2,29 +2,26 @@
 
 AI Agent Forensics
 
-Version: `1.0.260704`
+Version: `1.1.260705`
 
 ## Requirements
 
 - Windows 10 or 11
 - Python 3.11 or later
+- Git
 
 ## Initial setup
 
-Download and extract the repository ZIP from GitHub, or clone it with Git:
+Install Git before setting up TraceAgent. From the `TraceAgent` directory,
+install TraceAgent and all runtime dependencies:
 
 ```powershell
-git clone https://github.com/seturi/TraceAgent.git
-cd TraceAgent
+python -m pip install --user -e .
 ```
 
-From the extracted or cloned `TraceAgent` directory, install the dependencies:
-
-```powershell
-python -m pip install --user -e ".[dev]"
-```
-
-The command installs PySide6 and the development dependencies into the current user account's Python environment. A virtual environment is not required.
+The command installs PySide6, Brotli, CCL Chromium Reader, Dissect Target, and
+their transitive dependencies into the current user's Python environment. A
+virtual environment is not required.
 
 ## Run
 

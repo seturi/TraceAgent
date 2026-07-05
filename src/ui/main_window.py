@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import html
+import json
+from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -20,10 +24,12 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QSplitter,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextBrowser,
     QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
@@ -31,10 +37,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from analysis.ntfs.attribution import OperationVerdict, attribute_ntfs_events
+from analysis.ntfs.signatures import basename_of, normalize_path
 from collection.artifact_collector import ServiceArtifactCollector
 from collection.base import CollectionContext
+from collection.ntfs.collector import NtfsArtifactCollector
 from collection.service_catalog import ServiceDetection
-from core.models import ArtifactRecord, EvidenceSource, NormalizedEvent, SourceKind
+from core.models import (
+    ActorClass,
+    AgentAttribution,
+    ArtifactRecord,
+    EvidenceSource,
+    NormalizedEvent,
+    SourceKind,
+)
 from parsers.base import ParseContext
 from parsers.registry import ParserRegistry
 from reporting.parsed_writer import write_parsed_events
@@ -44,6 +60,31 @@ from version import __version__
 
 
 SERVICES = ("All services", "Claude Cowork", "Claude Code", "ChatGPT Desktop", "Antigravity", "Codex")
+LOCAL_SERVICES = ("Claude Cowork", "Claude Code", "ChatGPT Desktop", "Antigravity", "Codex")
+NTFS_ACTORS = ("All actors", "AI agent", "Human", "System", "Unknown")
+NTFS_BEHAVIORS = (
+    "All behaviors",
+    "create",
+    "modify",
+    "rename",
+    "move",
+    "copy",
+    "delete_permanent",
+    "delete_recycle",
+    "metadata_change",
+    "logfile_recovered",
+)
+_ATTRIBUTION_LABELS = {
+    "Confirmed": "confirmed",
+    "High": "high",
+    "Medium": "medium",
+    "Low": "low",
+    "Not attributed": "none",
+}
+# A parsed NTFS journal easily yields hundreds of thousands of events; rendering
+# them all into a QTableWidget freezes the UI.  Cap what is drawn and tell the
+# user to narrow with filters — the full set stays available for filtering.
+MAX_DISPLAY_ROWS = 5000
 IMAGE_FILTER = "Disk images (*.E01 *.e01 *.raw *.dd *.img *.vhd *.vhdx);;All files (*.*)"
 
 
@@ -56,6 +97,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.parser_registry = parser_registry or ParserRegistry()
         self.artifact_collector = artifact_collector or ServiceArtifactCollector()
+        self.ntfs_collector = NtfsArtifactCollector()
+        self.ntfs_verdicts: tuple[OperationVerdict, ...] = ()
+        self._ntfs_status = ""
         self.current_source: EvidenceSource | None = None
         self.service_detections: tuple[ServiceDetection, ...] = ()
         self.collected_artifacts: tuple[ArtifactRecord, ...] = ()
@@ -189,15 +233,16 @@ class MainWindow(QMainWindow):
         module_panel = QFrame(objectName="Panel")
         module_layout = QVBoxLayout(module_panel)
         module_layout.addWidget(QLabel("Parser modules", objectName="SectionTitle"))
-        module_layout.addWidget(QLabel("Parsers use the common module contract.", objectName="Muted"))
+        module_layout.addWidget(QLabel("Check the services to parse.", objectName="Muted"))
         self.module_tree = QTreeWidget()
-        self.module_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.module_tree.setSelectionMode(QAbstractItemView.NoSelection)
         self.module_tree.setHeaderLabels(("Module", "State"))
         self.module_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.module_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.ntfs_radios: list[tuple[QRadioButton, str]] = []
         for group, children in (
             ("Service artifact parsers", ("Claude Cowork", "Claude Code", "ChatGPT Desktop", "Antigravity", "Codex")),
-            ("Filesystem parsers", ("NTFS $MFT", "NTFS $LogFile", "NTFS $UsnJrnl")),
+            ("Filesystem parsers", ("NTFS $UsnJrnl", "NTFS $LogFile")),
         ):
             parent = QTreeWidgetItem((group, ""))
             self.module_tree.addTopLevelItem(parent)
@@ -212,12 +257,34 @@ class MainWindow(QMainWindow):
                 item = QTreeWidgetItem((child, state))
                 if group == "Service artifact parsers":
                     self.service_tree_items[child] = item
-                if parser is not None:
-                    item.setToolTip(0, parser.metadata.description)
-                    item.setData(0, Qt.UserRole, parser.metadata.parser_id)
                 parent.addChild(item)
+                if parser is None:
+                    continue
+                item.setToolTip(0, parser.metadata.description)
+                item.setData(0, Qt.UserRole, parser.metadata.parser_id)
+                if parser.metadata.category == "ntfs":
+                    # NTFS is required: shown as a locked radio button (on by
+                    # default, off on live systems), never a user checkbox.
+                    item.setText(0, "")
+                    radio = QRadioButton(child)
+                    radio.setAutoExclusive(False)
+                    radio.setChecked(True)
+                    radio.setEnabled(False)
+                    radio.setToolTip(parser.metadata.description)
+                    self.ntfs_radios.append((radio, parser.metadata.parser_id))
+                    self.module_tree.setItemWidget(item, 0, radio)
+                else:
+                    item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                    item.setCheckState(0, Qt.Checked)
             parent.setExpanded(True)
         module_layout.addWidget(self.module_tree, 1)
+        module_layout.addWidget(
+            QLabel(
+                "NTFS is required and locked on; on live systems it is locked off "
+                "(reading $MFT/$UsnJrnl needs Administrator).",
+                objectName="Muted",
+            )
+        )
         layout.addWidget(module_panel, 2)
 
         run_panel = QFrame(objectName="Panel")
@@ -257,54 +324,132 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(14, 14, 14, 14)
-        filter_bar = QFrame(objectName="Panel")
-        filters = QHBoxLayout(filter_bar)
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Search file path, tool, command, or session ID")
-        filters.addWidget(self.search_input, 2)
-        self.service_filter = QComboBox()
-        self.service_filter.addItems(SERVICES)
-        filters.addWidget(self.service_filter)
-        self.event_filter = QComboBox()
-        self.event_filter.addItems(("All events", "Create", "Modify", "Rename", "Move", "Copy", "Delete", "Permission", "Tool call"))
-        filters.addWidget(self.event_filter)
-        self.attribution_filter = QComboBox()
-        self.attribution_filter.addItems(("All attribution", "Confirmed", "High", "Medium", "Low", "Not attributed"))
-        filters.addWidget(self.attribution_filter)
-        self.agent_only = QCheckBox("AI-attributed only")
-        filters.addWidget(self.agent_only)
-        layout.addWidget(filter_bar)
+        layout.setSpacing(10)
+        layout.addWidget(
+            QLabel(
+                "Results are split into local application artifacts (by service) and "
+                "NTFS file-system events (by file/folder, with human vs AI-agent attribution).",
+                objectName="Muted",
+            )
+        )
+        self.analyze_tabs = QTabWidget()
+        self.analyze_tabs.setDocumentMode(True)
+        self.analyze_tabs.addTab(self._build_local_artifacts_view(), "Local artifacts")
+        self.analyze_tabs.addTab(self._build_ntfs_events_view(), "NTFS events")
+        layout.addWidget(self.analyze_tabs, 1)
+        return page
+
+    def _detail_panel(self, title: str, placeholder: str) -> tuple[QFrame, QTextEdit]:
+        panel = QFrame(objectName="DetailPanel")
+        panel.setMinimumWidth(330)
+        detail_layout = QVBoxLayout(panel)
+        detail_layout.addWidget(QLabel(title, objectName="SectionTitle"))
+        box = QTextEdit()
+        box.setReadOnly(True)
+        box.setPlaceholderText(placeholder)
+        detail_layout.addWidget(box, 1)
+        return panel, box
+
+    def _build_local_artifacts_view(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 8, 0, 0)
+        bar = QFrame(objectName="Panel")
+        filters = QHBoxLayout(bar)
+        self.la_search = QLineEdit()
+        self.la_search.setPlaceholderText("Search session ID, prompt, tool, command, or path")
+        self.la_search.textChanged.connect(self._refresh_local_tree)
+        filters.addWidget(self.la_search, 2)
+        self.la_type = QComboBox()
+        self.la_type.addItems(
+            ("All events", "Prompt", "Thinking", "Tool call", "Result", "Message", "Log")
+        )
+        self.la_type.currentIndexChanged.connect(self._refresh_local_timeline)
+        filters.addWidget(self.la_type)
+        outer.addWidget(bar)
 
         splitter = QSplitter(Qt.Horizontal)
-        timeline_panel = QFrame(objectName="Panel")
-        timeline_layout = QVBoxLayout(timeline_panel)
-        timeline_layout.addWidget(QLabel("File event timeline", objectName="SectionTitle"))
-        self.timeline_table = self._table(("Time", "Event", "Path", "Service", "Tool", "AI attribution", "Score"), 2)
-        self.timeline_table.setSortingEnabled(True)
-        timeline_layout.addWidget(self.timeline_table, 1)
-        splitter.addWidget(timeline_panel)
 
-        detail_panel = QFrame(objectName="DetailPanel")
-        detail_panel.setMinimumWidth(310)
-        detail_layout = QVBoxLayout(detail_panel)
-        detail_layout.addWidget(QLabel("Event details", objectName="SectionTitle"))
-        detail_layout.addWidget(QLabel("Select an event to inspect provenance and attribution evidence.", objectName="Muted"))
-        form = QFormLayout()
-        for label in ("Timestamp", "Event type", "File path", "Service", "Session", "Tool / command", "Raw source"):
-            value = QLabel("—")
-            value.setWordWrap(True)
-            form.addRow(label, value)
-        detail_layout.addLayout(form)
-        detail_layout.addWidget(QLabel("AI attribution", objectName="SectionTitle"))
-        detail_layout.addWidget(QLabel("Not evaluated"))
-        detail_layout.addWidget(QLabel("Attribution evidence", objectName="SectionTitle"))
-        reasons = QTextEdit()
-        reasons.setReadOnly(True)
-        detail_layout.addWidget(reasons, 1)
-        splitter.addWidget(detail_panel)
+        # Left: service -> session navigation tree
+        nav = QFrame(objectName="Panel")
+        nav_layout = QVBoxLayout(nav)
+        nav_layout.addWidget(QLabel("Sessions by service", objectName="SectionTitle"))
+        self.la_count = QLabel("No parsed local artifacts yet.", objectName="Muted")
+        self.la_count.setWordWrap(True)
+        nav_layout.addWidget(self.la_count)
+        self.la_tree = QTreeWidget()
+        self.la_tree.setHeaderLabels(("Service / session", "Events"))
+        self.la_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.la_tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.la_tree.itemSelectionChanged.connect(self._on_session_selected)
+        nav_layout.addWidget(self.la_tree, 1)
+        splitter.addWidget(nav)
+
+        # Center: conversation/activity timeline for the selected session
+        center = QFrame(objectName="Panel")
+        center_layout = QVBoxLayout(center)
+        center_layout.addWidget(QLabel("Conversation timeline", objectName="SectionTitle"))
+        self.la_session_label = QLabel("Select a session to reconstruct its activity.", objectName="Muted")
+        self.la_session_label.setWordWrap(True)
+        center_layout.addWidget(self.la_session_label)
+        self.la_chat = QTextBrowser()
+        self.la_chat.setOpenLinks(False)
+        self.la_chat.setStyleSheet("QTextBrowser { background:#fafbfc; border:none; }")
+        self.la_chat.anchorClicked.connect(self._on_chat_anchor)
+        center_layout.addWidget(self.la_chat, 1)
+        splitter.addWidget(center)
+
+        # Right: full event detail
+        panel, self.la_detail = self._detail_panel(
+            "Event details", "Select a timeline entry to inspect its full record."
+        )
+        splitter.addWidget(panel)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 5)
+        splitter.setStretchFactor(2, 3)
+        outer.addWidget(splitter, 1)
+        return page
+
+    def _build_ntfs_events_view(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 8, 0, 0)
+        bar = QFrame(objectName="Panel")
+        filters = QHBoxLayout(bar)
+        self.ntfs_search = QLineEdit()
+        self.ntfs_search.setPlaceholderText("Search file/folder path or evidence")
+        self.ntfs_search.textChanged.connect(self._refresh_ntfs_events)
+        filters.addWidget(self.ntfs_search, 2)
+        self.ntfs_actor = QComboBox()
+        self.ntfs_actor.addItems(NTFS_ACTORS)
+        self.ntfs_actor.currentIndexChanged.connect(self._refresh_ntfs_events)
+        filters.addWidget(self.ntfs_actor)
+        self.ntfs_behavior = QComboBox()
+        self.ntfs_behavior.addItems(NTFS_BEHAVIORS)
+        self.ntfs_behavior.currentIndexChanged.connect(self._refresh_ntfs_events)
+        filters.addWidget(self.ntfs_behavior)
+        outer.addWidget(bar)
+
+        splitter = QSplitter(Qt.Horizontal)
+        left = QFrame(objectName="Panel")
+        left_layout = QVBoxLayout(left)
+        self.ntfs_count = QLabel("No NTFS operations classified yet.", objectName="Muted")
+        left_layout.addWidget(self.ntfs_count)
+        self.ntfs_table = self._table(
+            ("Filename", "Path", "Actor", "Service", "Operations", "Last activity"), 1
+        )
+        self.ntfs_table.setSortingEnabled(True)
+        self.ntfs_table.itemSelectionChanged.connect(self._show_ntfs_detail)
+        left_layout.addWidget(self.ntfs_table, 1)
+        splitter.addWidget(left)
+        panel, self.ntfs_detail = self._detail_panel(
+            "File / folder activity",
+            "Select a file or folder to see its full NTFS activity timeline and the human vs AI-agent verdict.",
+        )
+        splitter.addWidget(panel)
         splitter.setStretchFactor(0, 5)
         splitter.setStretchFactor(1, 2)
-        layout.addWidget(splitter, 1)
+        outer.addWidget(splitter, 1)
         return page
 
     @staticmethod
@@ -367,20 +512,34 @@ class MainWindow(QMainWindow):
             self.load_button.setEnabled(True)
 
         self.current_source = source
+        self._update_ntfs_lock(source.kind)
         self.service_detections = detections
         self.collected_artifacts = ()
         self.collection_root = None
         self.parsed_events = ()
         self.case_paths = None
+        self._ntfs_status = ""
         self._show_service_detections(detections)
         self._update_parse_service_states()
         present_count = sum(detection.present for detection in detections)
         fs_text = f", {info.filesystems} filesystem(s)" if info.filesystems is not None else ""
+
+        needs_admin = source.kind == SourceKind.LIVE_SYSTEM and not _is_admin()
+        if needs_admin:
+            self._ntfs_status = (
+                "NTFS events are unavailable on this live system: reading $MFT/$UsnJrnl "
+                "requires running TraceAgent as Administrator. Analyse a disk image, or "
+                "relaunch elevated. (Service artifacts are still collected without admin.)"
+            )
+            QMessageBox.warning(self, "NTFS requires Administrator", self._ntfs_status)
         self.statusBar().showMessage(
             f"Source opened read-only: {info.user_homes} user profile(s){fs_text}; "
             f"{present_count} supported service(s) found"
+            + (" — NTFS needs Administrator" if needs_admin else "")
         )
-        self.collect_button.setEnabled(present_count > 0)
+        self.collect_button.setEnabled(
+            present_count > 0 or source.kind in self.ntfs_collector.metadata.source_kinds
+        )
         self.tabs.setCurrentIndex(0)
 
     def _show_service_detections(self, detections: tuple[ServiceDetection, ...]) -> None:
@@ -449,14 +608,31 @@ class MainWindow(QMainWindow):
             progress=self._collection_progress,
         )
         try:
-            records = tuple(self.artifact_collector.collect(self.current_source, context))
+            records: list[ArtifactRecord] = []
+            # Collect NTFS journals first so they are available even if the
+            # (potentially large) service-artifact copy is slow or interrupted.
+            if self.current_source.kind in self.ntfs_collector.metadata.source_kinds:
+                ntfs_context = CollectionContext(
+                    workspace=self.case_paths.root,
+                    calculate_sha256=self.hash_check.isChecked(),
+                    progress=self._collection_progress,
+                )
+                records.extend(self.ntfs_collector.collect(self.current_source, ntfs_context))
+                context.options["ntfs_collection_errors"] = ntfs_context.options.get(
+                    "ntfs_collection_errors", []
+                )
+            records.extend(self.artifact_collector.collect(self.current_source, context))
+            records = tuple(records)
         except (SourceAccessError, OSError, ValueError) as exc:
             QMessageBox.critical(self, "Collection", str(exc))
             self.statusBar().showMessage("Artifact collection failed")
             return
         finally:
             self.load_button.setEnabled(True)
-            self.collect_button.setEnabled(any(item.present for item in self.service_detections))
+            self.collect_button.setEnabled(
+                any(item.present for item in self.service_detections)
+                or self.current_source.kind in self.ntfs_collector.metadata.source_kinds
+            )
 
         self.collected_artifacts = records
         self.collection_root = self.case_paths.artifacts
@@ -473,6 +649,7 @@ class MainWindow(QMainWindow):
                 )
             )
         errors = context.options.get("collection_errors", [])
+        self._record_ntfs_collection_status(records, context)
         self.collection_progress.setValue(100)
         self.parse_button.setEnabled(bool(records) and bool(self.parser_registry.all()))
         self.statusBar().showMessage(
@@ -480,6 +657,33 @@ class MainWindow(QMainWindow):
             f"{self.case_paths.root}"
         )
         self.tabs.setCurrentIndex(1)
+
+    def _record_ntfs_collection_status(
+        self, records: tuple[ArtifactRecord, ...], context: CollectionContext
+    ) -> None:
+        """Make NTFS collection outcome visible so an empty NTFS view is explained."""
+        ntfs_collected = sum(1 for record in records if record.service == "NTFS")
+        ntfs_errors = context.options.get("ntfs_collection_errors", []) or []
+        if self.current_source is None:
+            return
+        if self.current_source.kind not in self.ntfs_collector.metadata.source_kinds:
+            self._ntfs_status = (
+                "NTFS events require a live-system or disk-image source. The current "
+                "source is an extracted artifact directory, which has no $MFT/$UsnJrnl."
+            )
+        elif ntfs_collected == 0:
+            reason = str(ntfs_errors[0].get("error")) if ntfs_errors else "no NTFS volume was found"
+            hint = (
+                " (a live system must be opened with Administrator privileges)"
+                if self.current_source.kind == SourceKind.LIVE_SYSTEM
+                else ""
+            )
+            self._ntfs_status = f"NTFS journals were not collected: {reason}{hint}"
+            self._append_collection_row(
+                ("NTFS", "filesystem journals", "—", "", "", f"Not collected — {reason}")
+            )
+        else:
+            self._ntfs_status = ""
 
     def _collection_progress(self, percent: int, message: str) -> None:
         self.collection_progress.setValue(percent)
@@ -492,27 +696,44 @@ class MainWindow(QMainWindow):
         for column, value in enumerate(values):
             self.collection_table.setItem(row, column, QTableWidgetItem(value))
 
+    def _update_ntfs_lock(self, source_kind: SourceKind) -> None:
+        """Lock the NTFS radios on (default) or off (live systems need Admin)."""
+        on = source_kind != SourceKind.LIVE_SYSTEM
+        for radio, _parser_id in getattr(self, "ntfs_radios", []):
+            radio.setChecked(on)
+            radio.setEnabled(False)  # locked either way
+
+    def _checked_parser_ids(self) -> set[str]:
+        ids: set[str] = set()
+        for group_index in range(self.module_tree.topLevelItemCount()):
+            group = self.module_tree.topLevelItem(group_index)
+            for child_index in range(group.childCount()):
+                child = group.child(child_index)
+                parser_id = child.data(0, Qt.UserRole)
+                if (
+                    parser_id
+                    and bool(child.flags() & Qt.ItemIsUserCheckable)
+                    and child.checkState(0) == Qt.Checked
+                ):
+                    ids.add(parser_id)
+        for radio, parser_id in getattr(self, "ntfs_radios", []):
+            if radio.isChecked():
+                ids.add(parser_id)
+        return ids
+
     def _run_selected_parsers(self) -> None:
         if self.current_source is None or self.collection_root is None or self.case_paths is None:
             QMessageBox.warning(self, "Parsing", "Collect service artifacts first.")
             return
 
         self.parse_table.setRowCount(0)
-        timeline_sorting = self.timeline_table.isSortingEnabled()
-        self.timeline_table.setSortingEnabled(False)
-        self.timeline_table.setRowCount(0)
         self.parse_log.clear()
-        selected_ids = {
-            item.data(0, Qt.UserRole)
-            for item in self.module_tree.selectedItems()
-            if item.data(0, Qt.UserRole)
-        }
         all_parsers = self.parser_registry.all()
-        parsers = tuple(
-            parser
-            for parser in all_parsers
-            if not selected_ids or parser.metadata.parser_id in selected_ids
-        )
+        parsers = _select_parsers(all_parsers, self._checked_parser_ids())
+        if not parsers:
+            QMessageBox.information(self, "Parsing", "Check at least one parser module to run.")
+            self.parse_button.setEnabled(True)
+            return
         parse_source = EvidenceSource(
             SourceKind.ARTIFACT_DIRECTORY,
             self.collection_root,
@@ -577,10 +798,15 @@ class MainWindow(QMainWindow):
             self.parse_progress.setValue(round(parser_index / max(len(parsers), 1) * 100))
             QApplication.processEvents()
 
-        self.parsed_events = tuple(sorted(all_events, key=lambda event: event.timestamp))
-        for event in self.parsed_events:
-            self._append_timeline_event(event)
-        self.timeline_table.setSortingEnabled(timeline_sorting)
+        outcome = attribute_ntfs_events(all_events)
+        self.ntfs_verdicts = outcome.verdicts
+        self.parsed_events = tuple(sorted(outcome.events, key=lambda event: event.timestamp))
+        self._populate_analyze_views()
+        if self.ntfs_verdicts:
+            self.parse_log.append(
+                f"[NTFS attribution] {len(self.ntfs_verdicts)} file operation(s) classified: "
+                + _verdict_summary(self.ntfs_verdicts)
+            )
         if not self.parse_log.toPlainText():
             self.parse_log.setPlainText(
                 f"Parsed {len(self.parsed_events)} normalized event(s) from "
@@ -599,22 +825,314 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{parser_name}: {message}")
         QApplication.processEvents()
 
-    def _append_timeline_event(self, event: NormalizedEvent) -> None:
-        row = self.timeline_table.rowCount()
-        self.timeline_table.insertRow(row)
+    def _populate_analyze_views(self) -> None:
+        self._event_by_id = {event.event_id: event for event in self.parsed_events}
+        self._local_events = tuple(
+            event for event in self.parsed_events if not event.parser_id.startswith("ntfs.")
+        )
+        self._local_service_counts = Counter(
+            (event.service or "unknown") for event in self._local_events
+        )
+        self._logfile_events = tuple(
+            event for event in self.parsed_events if event.parser_id == "ntfs.logfile"
+        )
+        self._verdict_by_op = {verdict.operation_id: verdict for verdict in self.ntfs_verdicts}
+        self._build_file_entries()
+        self._build_local_sessions()
+        self._refresh_ntfs_events()
+
+    def _build_file_entries(self) -> None:
+        """Group NTFS operations and $LogFile recoveries per file/folder."""
+        entries: dict[str, dict] = {}
+        for verdict in self.ntfs_verdicts:
+            key = normalize_path(verdict.target_path) or verdict.operation_id
+            entry = entries.setdefault(
+                key, {"path": verdict.target_path, "ops": [], "logs": []}
+            )
+            entry["ops"].append(verdict)
+            if not entry["path"]:
+                entry["path"] = verdict.target_path
+        for event in getattr(self, "_logfile_events", ()):
+            key = normalize_path(event.path) or event.event_id
+            entry = entries.setdefault(key, {"path": event.path, "logs": [], "ops": []})
+            entry["logs"].append(event)
+            if not entry["path"]:
+                entry["path"] = event.path
+
+        priority = {
+            ActorClass.AI_AGENT: 3,
+            ActorClass.HUMAN: 2,
+            ActorClass.SYSTEM: 1,
+            ActorClass.UNKNOWN: 0,
+        }
+        for key, entry in entries.items():
+            ops = sorted(entry["ops"], key=lambda v: v.start)
+            entry["ops"] = ops
+            if ops:
+                best = max(ops, key=lambda v: (priority[v.actor_class], v.confidence))
+                entry["actor"] = best.actor_class
+                entry["service"] = best.service
+                entry["confidence"] = best.confidence
+            else:
+                entry["actor"] = ActorClass.UNKNOWN
+                entry["service"] = None
+                entry["confidence"] = 0.0
+            times = [v.start for v in ops] + [e.timestamp for e in entry["logs"]]
+            entry["last"] = max(times) if times else None
+            entry["path"] = entry["path"] or key
+            entry["filename"] = basename_of(entry["path"]) or entry["path"]
+            entry["key"] = key
+
+        self._file_by_key = entries
+        self._file_entries = sorted(
+            entries.values(),
+            key=lambda e: e["last"] or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+
+    # -- Local artifacts view ------------------------------------------------
+    def _build_local_sessions(self) -> None:
+        """Group local-artifact events into per-service sessions (conversations)."""
+        sessions: dict[str, dict] = {}
+        for event in getattr(self, "_local_events", ()):
+            service = event.service or "Unknown"
+            session_id = event.session_id or "(session-less)"
+            key = f"{service} {session_id}"
+            entry = sessions.setdefault(
+                key, {"service": service, "session_id": session_id, "events": []}
+            )
+            entry["events"].append(event)
+        for entry in sessions.values():
+            entry["events"].sort(key=lambda e: e.timestamp)
+            entry["first"] = entry["events"][0].timestamp
+            entry["last"] = entry["events"][-1].timestamp
+        self._sessions = sessions
+        self._current_session_key = None
+        self._timeline_events: tuple[NormalizedEvent, ...] = ()
+        self.la_chat.clear()
+        self.la_session_label.setText("Select a session to reconstruct its activity.")
+        self.la_detail.clear()
+        self._refresh_local_tree()
+
+    def _refresh_local_tree(self) -> None:
+        tree = self.la_tree
+        tree.clear()
+        needle = self.la_search.text().strip().lower()
+        sessions = getattr(self, "_sessions", {})
+        by_service: dict[str, list] = {}
+        shown = 0
+        for key, entry in sessions.items():
+            if needle and not _session_matches(entry, needle):
+                continue
+            by_service.setdefault(entry["service"], []).append((key, entry))
+            shown += 1
+        for service in sorted(by_service):
+            entries = sorted(by_service[service], key=lambda item: item[1]["first"])
+            n_events = sum(len(e["events"]) for _, e in entries)
+            parent = QTreeWidgetItem((service, f"{len(entries)} · {n_events:,}"))
+            font = parent.font(0)
+            font.setBold(True)
+            parent.setFont(0, font)
+            tree.addTopLevelItem(parent)
+            for key, entry in entries:
+                session_id = entry["session_id"]
+                short = session_id if len(session_id) <= 18 else f"{session_id[:8]}…{session_id[-4:]}"
+                when = entry["first"].astimezone().strftime("%m-%d %H:%M")
+                child = QTreeWidgetItem((f"{when}  {short}", str(len(entry["events"]))))
+                child.setToolTip(0, session_id)
+                child.setData(0, Qt.UserRole, key)
+                parent.addChild(child)
+            parent.setExpanded(True)
+
+        total_sessions = len(sessions)
+        total_events = sum(len(e["events"]) for e in sessions.values())
+        if total_sessions == 0:
+            self.la_count.setText("No local artifact sessions parsed yet.")
+            return
+        counts = getattr(self, "_local_service_counts", Counter())
+        breakdown = "   ".join(f"{name}: {count:,}" for name, count in sorted(counts.items()) if name)
+        self.la_count.setText(
+            f"{shown} of {total_sessions} session(s)  ·  {total_events:,} events\n{breakdown}"
+        )
+
+    def _on_session_selected(self) -> None:
+        items = self.la_tree.selectedItems()
+        if not items:
+            return
+        key = items[0].data(0, Qt.UserRole)
+        if not key:  # a service group header, not a session
+            return
+        self._current_session_key = key
+        self._refresh_local_timeline()
+
+    def _refresh_local_timeline(self) -> None:
+        key = getattr(self, "_current_session_key", None)
+        entry = getattr(self, "_sessions", {}).get(key) if key else None
+        if entry is None:
+            self.la_chat.clear()
+            self._timeline_events = ()
+            return
+        kind_filter = _TYPE_FILTER.get(self.la_type.currentText())
+        shown: list[NormalizedEvent] = []
+        for event in entry["events"]:
+            _, kind = _event_kind(event)
+            if kind_filter and kind != kind_filter:
+                continue
+            shown.append(event)
+            if len(shown) >= MAX_DISPLAY_ROWS:
+                break
+        self._timeline_events = tuple(shown)
+        self.la_chat.setHtml(_chat_document(shown))
+        self.la_session_label.setText(
+            f"Session {entry['session_id']}  ·  {entry['service']}  ·  "
+            f"{entry['first'].astimezone().strftime('%Y-%m-%d %H:%M')}–"
+            f"{entry['last'].astimezone().strftime('%H:%M:%S')}  ·  "
+            f"{len(shown)}/{len(entry['events'])} shown"
+        )
+
+    def _on_chat_anchor(self, url) -> None:
+        target = url.toString()
+        if target.startswith("event:"):
+            event = self._event_by_id.get(target[len("event:") :])
+            if event is not None:
+                self._render_event_detail(event)
+
+    def _render_event_detail(self, event: NormalizedEvent) -> None:
+        icon, kind = _event_kind(event)
+        lines = [
+            f"{icon} {kind.upper()}",
+            f"Timestamp : {event.timestamp.astimezone().isoformat()}",
+            f"Service   : {event.service or '—'}",
+            f"Session   : {event.session_id or '—'}",
+            f"Actor     : {event.actor or '—'}",
+            f"Event type: {event.event_type}",
+        ]
+        if event.tool_name:
+            lines.append(f"Tool      : {event.tool_name}")
+        if event.path:
+            lines.append(f"Path      : {event.path}")
+        if event.command:
+            lines += ["", "Command:", _truncate(event.command, 2000)]
+        if event.result:
+            lines += ["", "Result / content:", _truncate(event.result, 3000)]
+        badges = _forensic_badges(event)
+        if badges:
+            lines += ["", "Forensic markers:"] + [f"  • {badge}" for badge in badges]
+        lines += ["", f"Raw source: {event.raw_reference or '—'}"]
+        self.la_detail.setPlainText("\n".join(lines))
+
+    # -- NTFS events view (per file/folder) ----------------------------------
+    def _refresh_ntfs_events(self) -> None:
+        table = self.ntfs_table
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
+        needle = self.ntfs_search.text().strip().lower()
+        actor = self.ntfs_actor.currentText()
+        behavior = self.ntfs_behavior.currentText()
+        entries = getattr(self, "_file_entries", ())
+        matched = 0
+        for entry in entries:
+            if actor != "All actors" and _actor_class_name(entry["actor"]) != actor:
+                continue
+            if behavior != "All behaviors" and not _entry_has_behavior(entry, behavior):
+                continue
+            if needle and needle not in _entry_haystack(entry):
+                continue
+            matched += 1
+            if table.rowCount() < MAX_DISPLAY_ROWS:
+                self._add_ntfs_file_row(entry)
+        table.setSortingEnabled(True)
+        total = len(entries)
+        if total == 0:
+            self.ntfs_count.setText(
+                self._ntfs_status
+                or "No NTFS events parsed yet — collect and parse a live-system or disk-image source."
+            )
+        else:
+            self.ntfs_count.setText(_count_text(table.rowCount(), matched, total, "file/folder"))
+
+    def _add_ntfs_file_row(self, entry: dict) -> None:
+        table = self.ntfs_table
+        row = table.rowCount()
+        table.insertRow(row)
+        last = entry["last"]
         values = (
-            event.timestamp.astimezone().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-            event.event_type,
-            event.path or "—",
-            event.service or "—",
-            event.tool_name or event.command or "—",
-            event.attribution.value,
-            f"{event.attribution_score:.2f}",
+            entry["filename"] or "—",
+            entry["path"] or "—",
+            _actor_class_label(entry["actor"], entry["service"]),
+            entry["service"] or "—",
+            str(len(entry["ops"]) + len(entry["logs"])),
+            last.astimezone().strftime("%Y-%m-%d %H:%M:%S") if last else "—",
         )
         for column, value in enumerate(values):
-            item = QTableWidgetItem(value)
-            item.setData(Qt.UserRole, event.event_id)
-            self.timeline_table.setItem(row, column, item)
+            item = QTableWidgetItem(str(value))
+            item.setData(Qt.UserRole, f"file:{entry['key']}")
+            table.setItem(row, column, item)
+
+    def _show_ntfs_detail(self) -> None:
+        items = self.ntfs_table.selectedItems()
+        if not items:
+            return
+        key = items[0].data(Qt.UserRole) or ""
+        if key.startswith("file:"):
+            self._show_ntfs_file(key[5:])
+
+    def _show_ntfs_file(self, key: str) -> None:
+        entry = getattr(self, "_file_by_key", {}).get(key)
+        if entry is None:
+            return
+        ops = entry["ops"]
+        logs = entry["logs"]
+        lines = [
+            f"File / folder : {entry['path']}",
+            f"Verdict       : {_actor_class_label(entry['actor'], entry['service'])}"
+            f"   (confidence {entry['confidence']:.2f})",
+            f"Activity      : {len(ops)} operation(s), {len(logs)} $LogFile record(s)",
+            "",
+            "── Activity timeline ──",
+        ]
+        if not ops:
+            lines.append("  (no USN operations — recovered from $LogFile only)")
+        for verdict in ops:
+            lines.append(
+                f"{verdict.start.astimezone().strftime('%Y-%m-%d %H:%M:%S')}  "
+                f"[{_actor_class_label(verdict.actor_class, verdict.service)}]  {verdict.behavior}"
+            )
+            flow = self._operation_flow(verdict)
+            if flow:
+                lines.append(f"    flow: {flow}")
+            if verdict.reasons:
+                lines.append(f"    evidence: {', '.join(verdict.reasons[:3])}")
+            if verdict.matched_event_id:
+                matched = self._event_by_id.get(verdict.matched_event_id)
+                if matched is not None:
+                    lines.append(
+                        f"    session match: {matched.service} / "
+                        f"{matched.tool_name or '-'} / {matched.session_id or '-'}"
+                    )
+        if logs:
+            lines += ["", "── Recovered from $LogFile ──"]
+            for event in logs:
+                meta = event.metadata
+                lines.append(
+                    f"  {meta.get('filename', '?')}   "
+                    f"modified={meta.get('fn_modified', '—')}  created={meta.get('fn_created', '—')}"
+                )
+        self.ntfs_detail.setPlainText("\n".join(lines))
+
+    def _operation_flow(self, verdict: OperationVerdict) -> str:
+        flow: list[str] = []
+        for event_id in verdict.event_ids:
+            event = self._event_by_id.get(event_id)
+            if event is not None:
+                flow.extend(str(reason) for reason in event.metadata.get("ntfs_reasons", []))
+        return " → ".join(flow)
+
+    def _selected_event(self, table: QTableWidget) -> NormalizedEvent | None:
+        items = table.selectedItems()
+        if not items:
+            return None
+        return self._event_by_id.get(items[0].data(Qt.UserRole))
 
     def _show_about(self) -> None:
         QMessageBox.about(
@@ -622,6 +1140,232 @@ class MainWindow(QMainWindow):
             "About TraceAgent",
             f"TraceAgent {__version__}\n\nCollection, parser orchestration, NTFS timeline analysis, and AI-agent attribution.",
         )
+
+
+def _is_admin() -> bool:
+    """Whether the process has Administrator rights (needed for live NTFS reads)."""
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:  # noqa: BLE001 - non-Windows or restricted environments
+        return False
+
+
+def _actor_class_name(actor_class: ActorClass) -> str:
+    return {
+        ActorClass.AI_AGENT: "AI agent",
+        ActorClass.HUMAN: "Human",
+        ActorClass.SYSTEM: "System",
+    }.get(actor_class, "Unknown")
+
+
+def _actor_class_label(actor_class: ActorClass, service: str | None = None) -> str:
+    if actor_class == ActorClass.AI_AGENT:
+        return f"AI · {service}" if service else "AI agent"
+    return _actor_class_name(actor_class)
+
+
+_TYPE_FILTER = {
+    "Prompt": "prompt",
+    "Thinking": "thinking",
+    "Tool call": "tool",
+    "Result": "result",
+    "Message": "message",
+    "Log": "log",
+}
+
+_FORENSIC_MARKERS = (
+    ("MCP automated tool call (contains_mcp_source)", "contains_mcp_source"),
+    ("High-risk action flagged (danger_level)", "danger_level"),
+    ("Sandbox permission request", "sandbox_permissions"),
+    ("Action justification recorded", "justification"),
+    ("User approval prompt (confirm_action)", "confirm_action"),
+    ("Encrypted reasoning content", "encrypted_content"),
+)
+
+
+def _oneline(text: object) -> str:
+    if not text:
+        return ""
+    return " ".join(str(text).split())
+
+
+def _event_kind(event: NormalizedEvent) -> tuple[str, str]:
+    """Classify a local-artifact event into a display kind + icon."""
+    event_type = (event.event_type or "").lower()
+    actor = (event.actor or "").lower()
+    if "log" in event_type:
+        return ("📄", "log")
+    if "tool_result" in event_type or "function_call_output" in event_type or "tool-result" in event_type:
+        return ("✅", "result")
+    if "tool_use" in event_type or "tool_call" in event_type or (
+        "function_call" in event_type and "output" not in event_type
+    ):
+        return ("🔧", "tool")
+    if "thinking" in event_type or "reasoning" in event_type:
+        return ("🧠", "thinking")
+    if actor == "user" or "user" in event_type or "prompt" in event_type:
+        return ("👤", "prompt")
+    if actor == "assistant" or "assistant" in event_type or "message" in event_type:
+        return ("💬", "message")
+    return ("•", "event")
+
+
+def _event_summary(event: NormalizedEvent, kind: str) -> str:
+    if kind == "tool":
+        name = event.tool_name or "tool"
+        extra = event.command or event.path
+        return f"{name}   {_oneline(extra)}".strip() if extra else name
+    text = event.result or event.command or event.path or event.event_type
+    return _truncate(_oneline(text), 400)
+
+
+def _session_matches(entry: dict, needle: str) -> bool:
+    if needle in entry["session_id"].lower() or needle in entry["service"].lower():
+        return True
+    return any(needle in _local_haystack(event) for event in entry["events"])
+
+
+def _forensic_badges(event: NormalizedEvent) -> list[str]:
+    try:
+        blob = json.dumps(event.metadata, ensure_ascii=False, default=str).lower()
+    except (TypeError, ValueError):
+        blob = ""
+    return [label for label, token in _FORENSIC_MARKERS if token in blob]
+
+
+# kind -> (default label, bubble alignment, background colour)
+_BUBBLE_STYLE = {
+    "user": ("👤 user", "right", "#c3e1ff"),
+    "message": ("💬 assistant", "left", "#eef0f2"),
+    "thinking": ("🧠 thinking", "left", "#f4efe0"),
+    "tool": ("🔧 tool", "left", "#ece7f8"),
+    "result": ("✅ result", "left", "#e2f4e4"),
+    "event": ("• event", "left", "#eef0f2"),
+}
+
+
+def _chat_document(events: list[NormalizedEvent] | tuple[NormalizedEvent, ...]) -> str:
+    """Render a session's events as a chat-style HTML transcript."""
+    if not events:
+        return ""
+    parts = ["<html><body style=\"font-family:'Segoe UI',sans-serif;\">"]
+    last_day = None
+    for event in events:
+        day = event.timestamp.astimezone().strftime("%Y-%m-%d")
+        if day != last_day:
+            parts.append(
+                f'<div style="text-align:center;color:#9aa0a6;font-size:11px;'
+                f'margin:12px 0 4px;">— {day} —</div>'
+            )
+            last_day = day
+        parts.append(_chat_bubble(event))
+    parts.append("</body></html>")
+    return "".join(parts)
+
+
+def _chat_bubble(event: NormalizedEvent) -> str:
+    _, kind = _event_kind(event)
+    stamp = event.timestamp.astimezone().strftime("%H:%M:%S")
+    label, align, background = _BUBBLE_STYLE.get(kind, _BUBBLE_STYLE["event"])
+    if kind == "tool" and event.tool_name:
+        label = f"🔧 {html.escape(event.tool_name)}"
+    href = f"event:{event.event_id}"  # the whole bubble is one clickable anchor
+    header = f'<span style="color:#5f6368;font-size:10px;">{label} &nbsp;·&nbsp; {stamp}</span>'
+
+    if kind == "log":
+        text = html.escape(
+            _truncate(_oneline(event.result or event.command or event.path or event.event_type), 200)
+        )
+        return (
+            '<div style="text-align:left;font-size:11px;margin:3px 0;">'
+            f'<a href="{href}" style="color:#9aa0a6;text-decoration:none;">'
+            f"📄 {stamp}&nbsp;&nbsp;{text}</a></div>"
+        )
+
+    extra = ""
+    if kind in ("tool", "result"):
+        extra = ";font-family:Consolas,'Courier New',monospace;font-size:11px"
+    elif kind == "thinking":
+        extra = ";font-style:italic;color:#6b6b6b"
+    # Qt's rich-text engine can't reliably right-align block bubbles, so render
+    # clean colour-coded bubbles (roles distinguished by colour + icon) at a
+    # fixed width.  The whole bubble is wrapped in an anchor so clicking anywhere
+    # on it opens the full event record in the detail panel.
+    inner = f"{header}<br/>{_bubble_body(event, kind)}"
+    return (
+        f'<table width="74%" cellspacing="0" cellpadding="0" style="margin:4px 0;"><tr>'
+        f'<td bgcolor="{background}" style="padding:7px 11px{extra}">'
+        f'<a href="{href}" style="color:#202124;text-decoration:none;">{inner}</a>'
+        "</td></tr></table>"
+    )
+
+
+def _bubble_body(event: NormalizedEvent, kind: str) -> str:
+    if kind == "tool":
+        pieces = []
+        if event.command:
+            pieces.append(html.escape(_truncate(_oneline(event.command), 600)))
+        if event.path:
+            pieces.append(f'<span style="color:#5f6368;">→ {html.escape(event.path)}</span>')
+        return "<br/>".join(pieces) or html.escape(event.tool_name or "tool call")
+    text = _truncate(str(event.result or event.command or event.path or ""), 1200)
+    return html.escape(text).replace("\n", "<br/>")
+
+
+def _local_haystack(event: NormalizedEvent) -> str:
+    return " ".join(
+        part.lower()
+        for part in (
+            event.path,
+            event.tool_name,
+            event.command,
+            event.session_id,
+            event.event_type,
+            event.service,
+        )
+        if part
+    )
+
+
+def _entry_haystack(entry: dict) -> str:
+    return f"{entry.get('path') or ''} {entry.get('filename') or ''}".lower()
+
+
+def _entry_has_behavior(entry: dict, behavior: str) -> bool:
+    if behavior == "logfile_recovered":
+        return bool(entry["logs"])
+    return any(verdict.behavior == behavior for verdict in entry["ops"])
+
+
+def _truncate(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _select_parsers(all_parsers, checked_ids):
+    """Return the parsers whose module is checked in the Parse tab.
+
+    Selection is explicit via checkboxes (services) and locked radios (NTFS);
+    the NTFS on/off state is decided by :meth:`MainWindow._update_ntfs_lock`.
+    """
+    return tuple(parser for parser in all_parsers if parser.metadata.parser_id in checked_ids)
+
+
+def _count_text(shown: int, matched: int, total: int, noun: str) -> str:
+    if matched > shown:
+        return (
+            f"Showing {shown:,} of {matched:,} matching {noun}(s) "
+            f"({total:,} total) — refine filters or search to narrow the view"
+        )
+    return f"{matched:,} of {total:,} {noun}(s)"
+
+
+def _verdict_summary(verdicts: tuple[OperationVerdict, ...]) -> str:
+    counts: dict[str, int] = {}
+    for verdict in verdicts:
+        counts[verdict.actor_class.value] = counts.get(verdict.actor_class.value, 0) + 1
+    return ", ".join(f"{name}={count}" for name, count in sorted(counts.items()))
 
 
 def _format_size(size: int | None) -> str:

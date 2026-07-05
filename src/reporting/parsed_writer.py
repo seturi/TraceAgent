@@ -48,6 +48,7 @@ def _event_payload(event: NormalizedEvent) -> dict[str, object]:
         "attribution": event.attribution.value,
         "attribution_score": event.attribution_score,
         "attribution_reasons": event.attribution_reasons,
+        "actor_class": event.actor_class.value,
         "raw_reference": event.raw_reference,
         "metadata": event.metadata,
     }
