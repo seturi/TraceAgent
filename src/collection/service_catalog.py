@@ -111,9 +111,11 @@ SERVICE_ARTIFACT_SPECS = (
         "local_storage",
         (
             "AppData/Local/Packages/OpenAI.ChatGPT-Desktop_*/LocalCache/Roaming/ChatGPT-Desktop/Local Storage/leveldb",
+            "AppData/Local/Packages/OpenAI.ChatGPT-Desktop_*/LocalCache/Roaming/ChatGPT/Local Storage/leveldb",
         ),
         (
             "**/LocalCache/Roaming/ChatGPT-Desktop/Local Storage/leveldb",
+            "**/LocalCache/Roaming/ChatGPT/Local Storage/leveldb",
         ),
     ),
     ServiceArtifactSpec(
@@ -121,9 +123,11 @@ SERVICE_ARTIFACT_SPECS = (
         "cache_data",
         (
             "AppData/Local/Packages/OpenAI.ChatGPT-Desktop_*/LocalCache/Roaming/ChatGPT-Desktop/Cache/Cache_Data",
+            "AppData/Local/Packages/OpenAI.ChatGPT-Desktop_*/LocalCache/Roaming/ChatGPT/Cache/Cache_Data",
         ),
         (
             "**/LocalCache/Roaming/ChatGPT-Desktop/Cache/Cache_Data",
+            "**/LocalCache/Roaming/ChatGPT/Cache/Cache_Data",
         ),
     ),
     ServiceArtifactSpec(
@@ -185,8 +189,8 @@ SERVICE_ARTIFACT_SPECS = (
     ServiceArtifactSpec(
         "Codex",
         "application_logs",
-        (".codex/log", "AppData/Roaming/Codex/logs", "AppData/Local/Codex/logs"),
-        ("**/.codex/log", "**/Roaming/Codex/logs", "**/Local/Codex/logs"),
+        (".codex/log",),
+        ("**/.codex/log",),
         include_file_patterns=("*.log", "**/*.log"),
     ),
 )
