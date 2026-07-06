@@ -77,6 +77,17 @@ REASON_ORDER: tuple[str, ...] = (
 NTFS_PARSER_ID = "ntfs.usnjrnl"
 NTFS_SERVICE = "NTFS"
 
+# User document file types — what the $MFT/$LogFile recovery parsers surface, so
+# investigators see their documents instead of OS/app temp-file churn.
+USER_DOCUMENT_EXTENSIONS = (
+    ".txt", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".hwp", ".hwpx", ".pdf", ".csv", ".rtf", ".md", ".odt", ".ods",
+)
+
+
+def is_user_document(name: str | None) -> bool:
+    return bool(name) and name.lower().endswith(USER_DOCUMENT_EXTENSIONS)
+
 # USN reason flag name -> bit value (NTFS ``USN_REASON``).  Kept here (rather than
 # importing dissect) so record decoding stays dependency-free and testable.
 REASON_BITS: dict[str, int] = {

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "traceagent"
-version = "1.1.260705"
+version = "1.2.260706"
 description = "Compact collection, parsing, and analysis UI for AI agent forensic artifacts"
 readme = "README.md"
 requires-python = ">=3.11"

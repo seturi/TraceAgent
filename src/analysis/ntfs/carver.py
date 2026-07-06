@@ -29,6 +29,32 @@ _OFF_NAME = 0x42
 
 # Namespace codes: 0=POSIX, 1=Win32, 2=DOS (8.3), 3=Win32&DOS.
 _DOS_NAMESPACE = 2
+# Maximum spread of a record's four $FILE_NAME timestamps for it to be credible.
+_MAX_TIME_SPAN = timedelta(days=365 * 30)
+
+# Unicode ranges that legitimately appear in file names (ASCII, accented Latin,
+# Hangul, Kana, CJK, full/half-width forms).  Random bytes that decode as UTF-16
+# scatter across unrelated scripts (combining marks, rare alphabets), so a name
+# with too many out-of-range characters is a carving false positive.
+_NAME_RANGES = (
+    (0x20, 0x7E),
+    (0x00A1, 0x017F),
+    (0x1100, 0x11FF),
+    (0x3000, 0x30FF),
+    (0x3130, 0x318F),
+    (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF),
+    (0xAC00, 0xD7A3),
+    (0xF900, 0xFAFF),
+    (0xFF00, 0xFFEF),
+)
+
+
+def _plausible_name(name: str) -> bool:
+    odd = sum(
+        0 if any(lo <= ord(ch) <= hi for lo, hi in _NAME_RANGES) else 1 for ch in name
+    )
+    return odd / len(name) <= 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,14 +117,23 @@ def carve_file_names(
             continue
         created = _filetime(struct.unpack_from("<Q", buf, offset + _OFF_CTIME)[0])
         modified = _filetime(struct.unpack_from("<Q", buf, offset + _OFF_MTIME)[0])
-        if not (_plausible(created) and _plausible(modified)):
+        mft_changed = _filetime(struct.unpack_from("<Q", buf, offset + _OFF_MFT_TIME)[0])
+        accessed = _filetime(struct.unpack_from("<Q", buf, offset + _OFF_ATIME)[0])
+        stamps = (created, modified, mft_changed, accessed)
+        # A real $FILE_NAME has four valid, clustered timestamps; random bytes
+        # rarely produce four plausible FILETIMEs within the same era.
+        if not all(_plausible(stamp) for stamp in stamps):
+            continue
+        if (max(stamps) - min(stamps)) > _MAX_TIME_SPAN:
             continue
         try:
             name = buf[offset + _OFF_NAME : end].decode("utf-16-le")
         except UnicodeDecodeError:
             continue
-        if not name or "\x00" in name or any(ord(ch) < 32 and ch != "\t" for ch in name):
+        if len(name) < 2 or "\x00" in name or any(ord(ch) < 32 and ch != "\t" for ch in name):
             continue
+        if not _plausible_name(name):
+            continue  # random bytes that happened to decode as mixed-script text
         if namespace == _DOS_NAMESPACE and not include_dos:
             continue
         results.append(
@@ -110,11 +145,59 @@ def carve_file_names(
                 name=name,
                 created=created,
                 modified=modified,
-                mft_modified=_filetime(struct.unpack_from("<Q", buf, offset + _OFF_MFT_TIME)[0]),
-                accessed=_filetime(struct.unpack_from("<Q", buf, offset + _OFF_ATIME)[0]),
+                mft_modified=mft_changed,
+                accessed=accessed,
                 flags=struct.unpack_from("<I", buf, offset + _OFF_FLAGS)[0],
             )
         )
+    return results
+
+
+_INDEX_ENTRY_HDR = 0x10  # INDEX_ENTRY header before the embedded $FILE_NAME
+# NTFS LFS redo/undo operation codes whose data carries a $FILE_NAME index entry,
+# mapped to the file operation they represent.  Borrowing this mechanism (the
+# opcode structurally identifies a real name and its operation) lets us reject
+# carving false positives and recover create/delete/rename semantics from
+# $LogFile — without a full, version-fragile LFS transaction decoder.
+INDEX_ENTRY_OPS = {
+    0x0C: "created",  # AddIndexEntryRoot
+    0x0D: "deleted",  # DeleteIndexEntryRoot
+    0x0E: "created",  # AddIndexEntryAllocation
+    0x0F: "deleted",  # DeleteIndexEntryAllocation
+    0x13: "modified",  # UpdateFileNameRoot
+    0x14: "modified",  # UpdateFileNameAllocation
+}
+
+
+def anchor_operation(buf: bytes, fn_offset: int) -> str | None:
+    """The file operation for a carved $FILE_NAME, from the log record before it.
+
+    A real ``$FILE_NAME`` sits at ``opcode_offset + redo/undo_offset + 0x10``
+    inside an index-entry log record; scanning back for that opcode both proves
+    the name is genuine and yields the operation.
+    """
+    for pos in range(fn_offset - 0x14, max(-1, fn_offset - 0x70), -2):
+        if pos < 0 or pos + 10 > len(buf):
+            continue
+        op = struct.unpack_from("<H", buf, pos)[0]
+        if op not in INDEX_ENTRY_OPS:
+            continue
+        redo_off = struct.unpack_from("<H", buf, pos + 4)[0]
+        undo_off = struct.unpack_from("<H", buf, pos + 8)[0]
+        if fn_offset in (pos + redo_off + _INDEX_ENTRY_HDR, pos + undo_off + _INDEX_ENTRY_HDR):
+            return INDEX_ENTRY_OPS[op]
+    return None
+
+
+def carve_index_operations(
+    buf: bytes, *, include_dos: bool = False
+) -> list[tuple[CarvedFileName, str]]:
+    """Carve only $FILE_NAMEs backed by an index-entry log record, with operation."""
+    results: list[tuple[CarvedFileName, str]] = []
+    for item in carve_file_names(buf, include_dos=include_dos):
+        operation = anchor_operation(buf, item.offset)
+        if operation is not None:
+            results.append((item, operation))
     return results
 
 

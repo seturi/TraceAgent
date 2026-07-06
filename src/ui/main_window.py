@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from analysis.ntfs.attribution import OperationVerdict, attribute_ntfs_events
+from analysis.ntfs.attribution import OperationVerdict, attribute_ntfs_events, build_agent_index
 from analysis.ntfs.signatures import basename_of, normalize_path
 from collection.artifact_collector import ServiceArtifactCollector
 from collection.base import CollectionContext
@@ -243,7 +243,7 @@ class MainWindow(QMainWindow):
         self.ntfs_radios: list[tuple[QRadioButton, str]] = []
         for group, children in (
             ("Service artifact parsers", ("Claude Cowork", "Claude Code", "ChatGPT Desktop", "Antigravity", "Codex")),
-            ("Filesystem parsers", ("NTFS $UsnJrnl", "NTFS $LogFile")),
+            ("Filesystem parsers", ("NTFS $MFT", "NTFS $UsnJrnl", "NTFS $LogFile")),
         ):
             parent = QTreeWidgetItem((group, ""))
             self.module_tree.addTopLevelItem(parent)
@@ -429,6 +429,13 @@ class MainWindow(QMainWindow):
         self.ntfs_behavior.addItems(NTFS_BEHAVIORS)
         self.ntfs_behavior.currentIndexChanged.connect(self._refresh_ntfs_events)
         filters.addWidget(self.ntfs_behavior)
+        self.ntfs_hide_system = QCheckBox("Hide system/background")
+        self.ntfs_hide_system.setChecked(True)
+        self.ntfs_hide_system.setToolTip(
+            "Hide OS/application churn (browser & app temp files with GUID names, caches)."
+        )
+        self.ntfs_hide_system.stateChanged.connect(self._refresh_ntfs_events)
+        filters.addWidget(self.ntfs_hide_system)
         outer.addWidget(bar)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -891,29 +898,37 @@ class MainWindow(QMainWindow):
         self._logfile_events = tuple(
             event for event in self.parsed_events if event.parser_id == "ntfs.logfile"
         )
+        self._mft_events = tuple(
+            event for event in self.parsed_events if event.parser_id == "ntfs.mft"
+        )
         self._verdict_by_op = {verdict.operation_id: verdict for verdict in self.ntfs_verdicts}
         self._build_file_entries()
         self._build_local_sessions()
         self._refresh_ntfs_events()
 
     def _build_file_entries(self) -> None:
-        """Group NTFS operations and $LogFile recoveries per file/folder."""
+        """Group NTFS operations, $MFT files and $LogFile recoveries per file/folder."""
         entries: dict[str, dict] = {}
-        for verdict in self.ntfs_verdicts:
-            key = normalize_path(verdict.target_path) or verdict.operation_id
-            entry = entries.setdefault(
-                key, {"path": verdict.target_path, "ops": [], "logs": []}
-            )
-            entry["ops"].append(verdict)
-            if not entry["path"]:
-                entry["path"] = verdict.target_path
-        for event in getattr(self, "_logfile_events", ()):
-            key = normalize_path(event.path) or event.event_id
-            entry = entries.setdefault(key, {"path": event.path, "logs": [], "ops": []})
-            entry["logs"].append(event)
-            if not entry["path"]:
-                entry["path"] = event.path
 
+        def entry_for(path, event_id):
+            key = normalize_path(path) or event_id
+            entry = entries.setdefault(
+                key, {"path": path, "ops": [], "logs": [], "mft": [], "key": key}
+            )
+            if not entry["path"]:
+                entry["path"] = path
+            return entry
+
+        for verdict in self.ntfs_verdicts:
+            entry_for(verdict.target_path, verdict.operation_id)["ops"].append(verdict)
+        for event in getattr(self, "_logfile_events", ()):
+            entry_for(event.path, event.event_id)["logs"].append(event)
+        for event in getattr(self, "_mft_events", ()):
+            entry_for(event.path, event.event_id)["mft"].append(event)
+
+        # Cross-analysis: files that only survive in $MFT/$LogFile (their USN was
+        # purged) are attributed by matching their path to agent session logs.
+        agent_index = build_agent_index(getattr(self, "_local_events", ()))
         priority = {
             ActorClass.AI_AGENT: 3,
             ActorClass.HUMAN: 2,
@@ -923,19 +938,42 @@ class MainWindow(QMainWindow):
         for key, entry in entries.items():
             ops = sorted(entry["ops"], key=lambda v: v.start)
             entry["ops"] = ops
+            entry["matched"] = None
             if ops:
                 best = max(ops, key=lambda v: (priority[v.actor_class], v.confidence))
                 entry["actor"] = best.actor_class
                 entry["service"] = best.service
                 entry["confidence"] = best.confidence
             else:
-                entry["actor"] = ActorClass.UNKNOWN
-                entry["service"] = None
-                entry["confidence"] = 0.0
-            times = [v.start for v in ops] + [e.timestamp for e in entry["logs"]]
+                match = agent_index.by_path.get(key)
+                confidence = 0.7
+                if not match:
+                    # fall back to a filename match, but only when it points to a
+                    # single service (avoids mis-crediting common file names).
+                    named = agent_index.by_name.get(basename_of(entry["path"]))
+                    if named and len({a.service for a in named}) == 1:
+                        match = named
+                        confidence = 0.5
+                if match:
+                    entry["actor"] = ActorClass.AI_AGENT
+                    entry["service"] = match[0].service
+                    entry["confidence"] = confidence
+                    entry["matched"] = match[0]
+                else:
+                    entry["actor"] = ActorClass.UNKNOWN
+                    entry["service"] = None
+                    entry["confidence"] = 0.0
+            times = (
+                [v.start for v in ops]
+                + [e.timestamp for e in entry["logs"]]
+                + [e.timestamp for e in entry["mft"]]
+            )
             entry["last"] = max(times) if times else None
-            entry["path"] = entry["path"] or key
-            entry["filename"] = basename_of(entry["path"]) or entry["path"]
+            # When the path is unresolved, fall back to the recovered file name
+            # (from $LogFile/$MFT/USN records) rather than the internal event id.
+            recovered = self._entry_recovered_name(entry)
+            entry["path"] = entry["path"] or recovered or key
+            entry["filename"] = basename_of(entry["path"]) or recovered or entry["path"]
             entry["key"] = key
 
         self._file_by_key = entries
@@ -944,6 +982,19 @@ class MainWindow(QMainWindow):
             key=lambda e: e["last"] or datetime.min.replace(tzinfo=timezone.utc),
             reverse=True,
         )
+
+    def _entry_recovered_name(self, entry: dict) -> str | None:
+        """The real file name recorded in $LogFile/$MFT/USN records for an entry."""
+        for event in entry["logs"] + entry.get("mft", []):
+            name = event.metadata.get("filename")
+            if name:
+                return str(name)
+        for verdict in entry["ops"]:
+            for event_id in verdict.event_ids:
+                event = self._event_by_id.get(event_id)
+                if event is not None and event.metadata.get("filename"):
+                    return str(event.metadata["filename"])
+        return None
 
     # -- Local artifacts view ------------------------------------------------
     def _build_local_sessions(self) -> None:
@@ -1084,9 +1135,12 @@ class MainWindow(QMainWindow):
         needle = self.ntfs_search.text().strip().lower()
         actor = self.ntfs_actor.currentText()
         behavior = self.ntfs_behavior.currentText()
+        hide_system = self.ntfs_hide_system.isChecked()
         entries = getattr(self, "_file_entries", ())
         matched = 0
         for entry in entries:
+            if hide_system and entry["actor"] == ActorClass.SYSTEM:
+                continue
             if actor != "All actors" and _actor_class_name(entry["actor"]) != actor:
                 continue
             if behavior != "All behaviors" and not _entry_has_behavior(entry, behavior):
@@ -1116,7 +1170,7 @@ class MainWindow(QMainWindow):
             entry["path"] or "—",
             _actor_class_label(entry["actor"], entry["service"]),
             entry["service"] or "—",
-            str(len(entry["ops"]) + len(entry["logs"])),
+            str(len(entry["ops"]) + len(entry["logs"]) + len(entry.get("mft", []))),
             _format_local_datetime(last, "%Y-%m-%d %H:%M:%S") if last else "—",
         )
         for column, value in enumerate(values):
@@ -1138,16 +1192,18 @@ class MainWindow(QMainWindow):
             return
         ops = entry["ops"]
         logs = entry["logs"]
+        mft = entry.get("mft", [])
         lines = [
             f"File / folder : {entry['path']}",
             f"Verdict       : {_actor_class_label(entry['actor'], entry['service'])}"
             f"   (confidence {entry['confidence']:.2f})",
-            f"Activity      : {len(ops)} operation(s), {len(logs)} $LogFile record(s)",
+            f"Activity      : {len(ops)} operation(s), {len(mft)} $MFT, {len(logs)} $LogFile record(s)",
             "",
             "── Activity timeline ──",
         ]
         if not ops:
-            lines.append("  (no USN operations — recovered from $LogFile only)")
+            recovered = ", ".join(s for s, present in (("$MFT", mft), ("$LogFile", logs)) if present)
+            lines.append(f"  (no USN operations — recovered from {recovered or 'other artifacts'})")
         for verdict in ops:
             lines.append(
                 f"{_format_local_datetime(verdict.start, '%Y-%m-%d %H:%M:%S')}  "
@@ -1165,12 +1221,32 @@ class MainWindow(QMainWindow):
                         f"    session match: {matched.service} / "
                         f"{matched.tool_name or '-'} / {matched.session_id or '-'}"
                     )
+        if mft:
+            lines += ["", "── Present in $MFT (file inventory) ──"]
+            for event in mft[:5]:
+                meta = event.metadata
+                lines.append(f"  {meta.get('full_path') or meta.get('filename', '?')}")
+                lines.append(
+                    f"    created={meta.get('fn_created', '—')}  modified={meta.get('fn_modified', '—')}"
+                    f"  accessed={meta.get('fn_accessed', '—')}"
+                )
+        if entry.get("matched") is not None:
+            activity = entry["matched"]
+            lines += [
+                "",
+                "── Cross-analysis (agent session-log path match) ──",
+                f"  service : {activity.service}",
+                f"  tool    : {activity.tool_name or '-'}",
+                f"  session : {activity.session_id or '-'}",
+                f"  time    : {_format_local_datetime(activity.timestamp)}",
+            ]
         if logs:
-            lines += ["", "── Recovered from $LogFile ──"]
+            lines += ["", "── Recovered from $LogFile (index-entry operations) ──"]
             for event in logs:
                 meta = event.metadata
+                op = meta.get("operation", "recovered")
                 lines.append(
-                    f"  {meta.get('filename', '?')}   "
+                    f"  [{op}] {meta.get('filename', '?')}   "
                     f"modified={meta.get('fn_modified', '—')}  created={meta.get('fn_created', '—')}"
                 )
         self.ntfs_detail.setPlainText("\n".join(lines))

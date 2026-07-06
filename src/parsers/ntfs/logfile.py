@@ -15,8 +15,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from pathlib import Path
 
-from analysis.ntfs.events import NTFS_SERVICE
-from analysis.ntfs.carver import CarvedFileName, carve_file_names, dedupe
+from analysis.ntfs.events import NTFS_SERVICE, is_user_document
+from analysis.ntfs.carver import CarvedFileName, carve_index_operations
 from core.models import ActorClass, AgentAttribution, ArtifactRecord, EvidenceSource, NormalizedEvent
 from parsers.base import ArtifactParser, EventSink, ParseContext, ParserMetadata
 from utils.structured_data import file_timestamp
@@ -72,11 +72,26 @@ class NtfsLogFileParser(ArtifactParser):
             resolver = _path_resolver(mft_path if isinstance(mft_path, str) else None)
             fallback = file_timestamp(log)
             try:
-                carved = dedupe(carve_file_names(log.read_bytes()))
-                for item in carved:
+                seen: set[tuple] = set()
+                for item, operation in carve_index_operations(log.read_bytes()):
                     if context.cancelled():
                         break
-                    emit(_carved_event(source, self.metadata.parser_id, item, resolver, fallback))
+                    if not is_user_document(item.name):
+                        continue  # skip OS/app temp churn — surface user documents
+                    key = (
+                        item.parent_reference,
+                        item.name,
+                        operation,
+                        item.modified.isoformat() if item.modified else "",
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    emit(
+                        _carved_event(
+                            source, self.metadata.parser_id, item, operation, resolver, fallback
+                        )
+                    )
             except (OSError, ValueError) as exc:
                 errors.append({"path": str(log), "error": str(exc)})
             context.progress(
@@ -111,6 +126,7 @@ def _carved_event(
     source: EvidenceSource,
     parser_id: str,
     item: CarvedFileName,
+    operation: str,
     resolver,
     fallback,
 ) -> NormalizedEvent:
@@ -121,7 +137,7 @@ def _carved_event(
         source_id=source.source_id,
         parser_id=parser_id,
         timestamp=timestamp,
-        event_type="ntfs_logfile_filename",
+        event_type=f"ntfs_logfile_{operation}",
         path=full_path,
         service=NTFS_SERVICE,
         attribution=AgentAttribution.NONE,
@@ -129,6 +145,7 @@ def _carved_event(
         raw_reference=f"logfile_offset={item.offset}",
         metadata={
             "filename": item.name,
+            "operation": operation,
             "parent_reference": item.parent_reference,
             "namespace": item.namespace,
             "full_path": full_path,

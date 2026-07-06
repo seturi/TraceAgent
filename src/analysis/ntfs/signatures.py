@@ -11,6 +11,7 @@ then confirms or refines the guess.
 from __future__ import annotations
 
 import re
+import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -78,13 +79,29 @@ _USER_DOC_HINTS = (
 
 
 def normalize_path(path: str | None) -> str | None:
+    """Canonicalise a path so $MFT, USN and agent session-log paths compare equal.
+
+    Handles Windows/`\\?\\`/UNC forms, ``file://`` URIs with ``%20`` encoding
+    (agent logs), WSL ``/mnt/c`` mounts and drive letters, always yielding a
+    lower-case, forward-slash, leading-slash path.
+    """
     if not path:
         return None
-    value = path.replace("\\", "/").strip()
-    value = re.sub(r"^//[?.]/", "", value)  # strip \\?\ / \\.\ prefixes
-    value = re.sub(r"^[a-zA-Z]:", "", value)  # strip drive letter
+    value = path.strip()
+    if "%" in value:
+        try:
+            value = urllib.parse.unquote(value)
+        except (ValueError, TypeError):
+            pass
+    value = value.replace("\\", "/")
+    value = re.sub(r"^file:/*", "/", value, flags=re.IGNORECASE)  # file:// scheme
+    value = re.sub(r"^//[?.]/", "/", value)  # \\?\ / \\.\ prefixes
+    value = re.sub(r"^/*[a-zA-Z]:", "/", value)  # drive letter (any leading slashes) -> root
+    value = re.sub(r"^/mnt/[a-zA-Z]/", "/", value)  # WSL drive mount -> root
     while "//" in value:
         value = value.replace("//", "/")
+    if not value.startswith("/"):
+        value = "/" + value  # a consistent leading slash so $MFT and log paths align
     return value.lower()
 
 
