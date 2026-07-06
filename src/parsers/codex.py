@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from core.models import AgentAttribution, ArtifactRecord, EvidenceSource, NormalizedEvent
 from parsers.base import ArtifactParser, EventSink, ParseContext, ParserMetadata
-from utils.structured_data import file_timestamp, iter_sqlite_rows, parse_timestamp
+from utils.structured_data import file_timestamp, iter_sqlite_rows, parse_timestamp, sqlite_tables
 from version import __version__
 
 _SERVICE_NAME = "Codex"
@@ -84,7 +84,121 @@ def _derive_actor(record_type: str, payload: dict) -> str | None:
     return None
 
 
+def _function_call_command(payload: dict) -> str | None:
+    arguments = payload.get("arguments")
+    if not isinstance(arguments, str):
+        return None
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        return arguments
+    if isinstance(parsed, dict):
+        command = parsed.get("command")
+        if isinstance(command, str):
+            return command
+        if isinstance(command, list):
+            return " ".join(str(part) for part in command)
+    return arguments
+
+
+def _derive_display(
+    record_type: str, payload: dict, sanitized: dict
+) -> tuple[str | None, str | None, str | None]:
+    """Map a session-log record onto the UI's (tool_name, command, result) fields."""
+    if record_type == "response_item":
+        sub_type = payload.get("type")
+        if sub_type == "message":
+            text = sanitized.get("text")
+            return None, None, (text if isinstance(text, str) else None)
+        if sub_type == "function_call":
+            name = payload.get("name")
+            return (
+                name if isinstance(name, str) else None,
+                _function_call_command(payload),
+                None,
+            )
+        if sub_type == "function_call_output":
+            output = payload.get("output")
+            return None, None, (output if isinstance(output, str) else None)
+    if record_type == "event_msg":
+        sub_type = payload.get("type")
+        if sub_type in ("user_message", "agent_message"):
+            message = payload.get("message")
+            return None, None, (message if isinstance(message, str) else None)
+    return None, None, None
+
+
+# Verified against real state_*.sqlite `threads` / logs_*.sqlite `logs` tables:
+# these columns hold actual human-readable content, in priority order, so
+# prefer them over the generic key=value dump.
+_TABLE_RESULT_COLUMNS = {
+    "threads": ("first_user_message", "title", "preview"),
+    "logs": ("feedback_log_body",),
+}
+
+# `logs` rows carry the session/thread UUID in `thread_id`, not `id` (verified:
+# values there match real thread ids from `threads.id` and the session JSONL).
+_TABLE_SESSION_ID_COLUMNS = {
+    "threads": "id",
+    "logs": "thread_id",
+}
+
+
+def _row_result(table_name: str, values: dict[str, object]) -> str | None:
+    for column in _TABLE_RESULT_COLUMNS.get(table_name, ()):
+        value = values.get(column)
+        if isinstance(value, str) and value:
+            return value
+    return _row_summary(values)
+
+
+def _row_session_id(table_name: str, values: dict[str, object]) -> str | None:
+    column = _TABLE_SESSION_ID_COLUMNS.get(table_name)
+    if column is None:
+        return None
+    value = values.get(column)
+    return value if isinstance(value, str) else None
+
+
+def _row_summary(
+    values: dict[str, object],
+    *,
+    max_fields: int = 6,
+    max_field_length: int = 200,
+    max_total_length: int = 1500,
+) -> str | None:
+    """Render a sqlite row as a readable one-line summary for the UI's result field.
+
+    Generic fallback for tables/columns that haven't been individually verified
+    yet — surfaces every non-empty column instead of leaving the event body blank.
+    """
+    parts: list[str] = []
+    for key, value in values.items():
+        if value is None or value == "":
+            continue
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+        if len(text) > max_field_length:
+            text = text[:max_field_length] + "…"
+        parts.append(f"{key}={text}")
+        if len(parts) >= max_fields:
+            break
+    if not parts:
+        return None
+    summary = " | ".join(parts)
+    return summary if len(summary) <= max_total_length else summary[:max_total_length] + "…"
+
+
 def _row_timestamp(values: dict[str, object]) -> datetime | None:
+    # `logs` rows pack sub-second precision into `ts` (whole seconds) + `ts_nanos`
+    # separately (verified: hundreds of rows can share the same whole second),
+    # so combine them before falling back to the generic single-column guess.
+    ts, ts_nanos = values.get("ts"), values.get("ts_nanos")
+    if isinstance(ts, (int, float)) and isinstance(ts_nanos, (int, float)):
+        try:
+            return datetime.fromtimestamp(ts + ts_nanos / 1_000_000_000, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            pass
+
     lowered = {key.lower(): key for key in values}
     for candidate in _TIMESTAMP_COLUMN_CANDIDATES:
         key = lowered.get(candidate)
@@ -240,12 +354,17 @@ class CodexParser(ArtifactParser):
         db_path = Path(artifact.path)
         fallback_timestamp = file_timestamp(db_path)
 
+        # A `logs_*.sqlite` with no rows logged yet has no `logs` table at all
+        # (verified against a real sample) — that's an empty file, not an error.
+        if table_name not in sqlite_tables(db_path):
+            return
+
         for row in iter_sqlite_rows(db_path, tables=(table_name,)):
             if context.cancelled():
                 return
 
             timestamp = _row_timestamp(row.values) or fallback_timestamp
-            session_id = row.values.get("id") if table_name == "threads" else None
+            session_id = _row_session_id(table_name, row.values)
 
             emit(
                 NormalizedEvent(
@@ -255,6 +374,7 @@ class CodexParser(ArtifactParser):
                     event_type=f"codex_{table_name}_record",
                     service=_SERVICE_NAME,
                     session_id=session_id,
+                    result=_row_result(table_name, row.values),
                     attribution=AgentAttribution.HIGH,
                     attribution_score=0.8,
                     attribution_reasons=(f"codex_desktop_{table_name}_table",),
@@ -294,6 +414,8 @@ class CodexParser(ArtifactParser):
                 sub_type = payload.get("type") if record_type in ("event_msg", "response_item") else None
                 event_type = f"codex_{record_type}.{sub_type}" if sub_type else f"codex_{record_type}"
                 timestamp = parse_timestamp(record.get("timestamp")) or fallback_timestamp
+                sanitized = _sanitize_payload(payload)
+                tool_name, command, result = _derive_display(record_type, payload, sanitized)
 
                 emit(
                     NormalizedEvent(
@@ -304,11 +426,14 @@ class CodexParser(ArtifactParser):
                         service=_SERVICE_NAME,
                         session_id=current_session_id,
                         actor=_derive_actor(record_type, payload),
+                        tool_name=tool_name,
+                        command=command,
+                        result=result,
                         attribution=AgentAttribution.HIGH,
                         attribution_score=0.8,
                         attribution_reasons=("codex_desktop_session_log_path",),
                         raw_reference=artifact.record_id,
-                        metadata=_sanitize_payload(payload),
+                        metadata=sanitized,
                     )
                 )
 
