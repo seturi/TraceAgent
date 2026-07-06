@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,14 +61,72 @@ def _from_unix(value: object) -> datetime | None:
     return None
 
 
+# Verified against a real ChatGPT Desktop cache export: these content_types
+# carry their readable text in a plain string field other than "parts".
+_CONTENT_TEXT_FIELDS = {
+    "reasoning_recap": "content",  # e.g. "2초 동안 생각함"
+    "code": "text",  # tool/connector call payload
+}
+
+
 def _extract_text(content: object) -> str | None:
-    if not isinstance(content, dict) or content.get("content_type") != "text":
+    if not isinstance(content, dict):
         return None
-    parts = content.get("parts")
-    if not isinstance(parts, list):
+    content_type = content.get("content_type")
+    if content_type == "text":
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            return None
+        texts = [part for part in parts if isinstance(part, str) and part]
+        return "\n".join(texts) if texts else None
+    field = _CONTENT_TEXT_FIELDS.get(content_type)
+    if field is not None:
+        value = content.get(field)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _content_fallback(content: object, *, max_length: int = 1500) -> str | None:
+    """Readable stand-in for non-"text" message content (code execution, browsing,
+    images, etc.) whose exact shape hasn't been verified against a real sample.
+
+    Rather than guessing per-content_type field names, this labels the block with
+    its content_type and dumps it as JSON, so the event body is never blank even
+    when it isn't a plain-text message.
+    """
+    if not isinstance(content, dict) or not content:
         return None
-    texts = [part for part in parts if isinstance(part, str) and part]
-    return "\n".join(texts) if texts else None
+    content_type = content.get("content_type")
+    try:
+        text = json.dumps(content, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        text = str(content)
+    prefix = f"[{content_type}] " if isinstance(content_type, str) else ""
+    summary = f"{prefix}{text}"
+    return summary if len(summary) <= max_length else summary[:max_length] + "…"
+
+
+def _local_storage_summary(
+    storage_key: object,
+    value: object,
+    *,
+    max_length: int = 1500,
+) -> str | None:
+    """Readable one-line preview for the UI's result field.
+
+    The Local Storage key/value schema hasn't been verified against a real
+    ChatGPT Desktop sample, so this doesn't guess which keys hold conversation
+    content — it just surfaces the raw value instead of leaving the bubble blank.
+    """
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    if not text:
+        return None
+    prefix = f"{storage_key}: " if isinstance(storage_key, str) and storage_key else ""
+    summary = f"{prefix}{text}"
+    return summary if len(summary) <= max_length else summary[:max_length] + "…"
 
 
 def _iter_conversation_messages(conversation: dict):
@@ -232,6 +291,7 @@ class ChatGPTParser(ArtifactParser):
                     timestamp=record.timestamp or fallback_timestamp,
                     event_type="chatgpt_local_storage_record",
                     service=_SERVICE_NAME,
+                    result=_local_storage_summary(record.storage_key, record.value),
                     attribution=AgentAttribution.HIGH,
                     attribution_score=0.8,
                     attribution_reasons=("chatgpt_desktop_local_storage_path",),
@@ -280,6 +340,7 @@ class ChatGPTParser(ArtifactParser):
                     path=record.url,
                     service=_SERVICE_NAME,
                     session_id=conversation_id,
+                    result=conversation.get("title"),
                     attribution=AgentAttribution.HIGH,
                     attribution_score=0.85,
                     attribution_reasons=("chatgpt_desktop_cache_conversation_json",),
@@ -317,6 +378,7 @@ class ChatGPTParser(ArtifactParser):
                         service=_SERVICE_NAME,
                         session_id=conversation_id,
                         actor=author.get("role"),
+                        result=text or _content_fallback(content),
                         attribution=AgentAttribution.HIGH,
                         attribution_score=0.85,
                         attribution_reasons=("chatgpt_desktop_cache_conversation_json",),

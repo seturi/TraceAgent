@@ -160,6 +160,17 @@ def _row_session_id(table_name: str, values: dict[str, object]) -> str | None:
     return value if isinstance(value, str) else None
 
 
+# Verified against a real `threads` table: `thread_source` matches the same
+# "user"/"subagent" values seen in the session JSONL's session_meta payload.
+_THREAD_SOURCE_ACTORS = {"user": "user", "subagent": "assistant"}
+
+
+def _row_actor(table_name: str, values: dict[str, object]) -> str | None:
+    if table_name == "threads":
+        return _THREAD_SOURCE_ACTORS.get(values.get("thread_source"))
+    return None
+
+
 def _row_summary(
     values: dict[str, object],
     *,
@@ -374,6 +385,7 @@ class CodexParser(ArtifactParser):
                     event_type=f"codex_{table_name}_record",
                     service=_SERVICE_NAME,
                     session_id=session_id,
+                    actor=_row_actor(table_name, row.values),
                     result=_row_result(table_name, row.values),
                     attribution=AgentAttribution.HIGH,
                     attribution_score=0.8,
