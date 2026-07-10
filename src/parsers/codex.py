@@ -223,6 +223,17 @@ _TABLE_SESSION_ID_COLUMNS = {
     "logs": "thread_id",
 }
 
+# The `logs` table is Codex's internal feedback/telemetry log, not conversation
+# content (unlike `threads`, which indexes actual sessions) - low-signal by
+# default so it doesn't crowd out prompts/tool calls/messages in the UI.
+_LOW_IMPORTANCE_TABLES = {"logs"}
+
+# event_msg sub-types that are Codex's own streaming/lifecycle bookkeeping
+# (superseded by the final agent_message/agent_reasoning, or pure protocol
+# noise like token counts) rather than conversation content a reviewer needs
+# to read by default.
+_LOW_IMPORTANCE_EVENT_MSG_TYPES = {"agent_message_delta", "agent_reasoning_delta"}
+
 
 def _row_result(table_name: str, values: dict[str, object]) -> str | None:
     for column in _TABLE_RESULT_COLUMNS.get(table_name, ()):
@@ -456,6 +467,9 @@ class CodexParser(ArtifactParser):
 
             timestamp = _row_timestamp(row.values) or fallback_timestamp
             session_id = _row_session_id(table_name, row.values)
+            metadata = dict(row.values)
+            if table_name in _LOW_IMPORTANCE_TABLES:
+                metadata["importance"] = "low"
 
             emit(
                 NormalizedEvent(
@@ -471,7 +485,7 @@ class CodexParser(ArtifactParser):
                     attribution_score=0.8,
                     attribution_reasons=(f"codex_desktop_{table_name}_table",),
                     raw_reference=f"{artifact.record_id}:table={row.table}:row={row.row_number}",
-                    metadata=row.values,
+                    metadata=metadata,
                 )
             )
 
@@ -518,8 +532,16 @@ class CodexParser(ArtifactParser):
                 timestamp = parse_timestamp(record.get("timestamp")) or fallback_timestamp
                 sanitized = _sanitize_payload(payload)
                 tool_name, command, result = _derive_display(record_type, payload, sanitized)
-                if tool_name is None and command is None and result is None:
+                is_unrecognized = tool_name is None and command is None and result is None
+                if is_unrecognized:
                     result = _payload_fallback(sanitized)
+                # Anything this parser doesn't recognize as conversation content
+                # (task lifecycle, token counts, approvals, ...) falls back to a
+                # raw payload dump - that's exactly the noise a reviewer wants
+                # collapsed by default, along with streaming deltas that are
+                # superseded by their own final agent_message/agent_reasoning.
+                if is_unrecognized or sub_type in _LOW_IMPORTANCE_EVENT_MSG_TYPES:
+                    sanitized["importance"] = "low"
 
                 emit(
                     NormalizedEvent(

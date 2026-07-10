@@ -6,7 +6,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSizeF
 from PySide6.QtGui import QAction, QTextDocument
 from PySide6.QtPrintSupport import QPrinter
 from PySide6.QtWidgets import (
@@ -386,6 +386,13 @@ class MainWindow(QMainWindow):
         )
         self.la_type.currentIndexChanged.connect(self._refresh_local_timeline)
         filters.addWidget(self.la_type)
+        self.la_show_low_importance = QCheckBox("Show low-importance events")
+        self.la_show_low_importance.setToolTip(
+            "Include internal bookkeeping (telemetry, streaming deltas, raw log/session "
+            "metadata) that parsers flag as low-signal and hide by default."
+        )
+        self.la_show_low_importance.toggled.connect(self._refresh_local_timeline)
+        filters.addWidget(self.la_show_low_importance)
         outer.addWidget(bar)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -1101,8 +1108,11 @@ class MainWindow(QMainWindow):
             self._timeline_events = ()
             return
         kind_filter = _TYPE_FILTER.get(self.la_type.currentText())
+        show_low_importance = self.la_show_low_importance.isChecked()
         shown: list[NormalizedEvent] = []
         for event in entry["events"]:
+            if not show_low_importance and event.metadata.get("importance") == "low":
+                continue
             _, kind = _event_kind(event)
             if kind_filter and kind != kind_filter:
                 continue
@@ -1389,6 +1399,12 @@ class MainWindow(QMainWindow):
         printer = QPrinter(QPrinter.HighResolution)
         printer.setOutputFormat(QPrinter.PdfFormat)
         printer.setOutputFileName(str(destination))
+        # Without an explicit page size, QTextDocument lays out at its default
+        # ~271pt width instead of the printer's actual page width, so at
+        # QPrinter.HighResolution's DPI everything (especially table text)
+        # renders squeezed into a tiny corner and reads as illegible smudges,
+        # even though the underlying text is intact (selects/copies fine).
+        document.setPageSize(QSizeF(printer.pageRect(QPrinter.Unit.Point).size()))
         try:
             document.print_(printer)
         except OSError as exc:

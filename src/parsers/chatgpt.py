@@ -9,7 +9,7 @@ from core.models import AgentAttribution, ArtifactRecord, EvidenceSource, Normal
 from parsers.base import ArtifactParser, EventSink, ParseContext, ParserMetadata
 from utils.chromium_cache import ChromiumCacheParser, decode_body, try_parse_json
 from utils.chromium_localstorage import ChromiumLocalStorageParser
-from utils.structured_data import load_collection_manifest
+from utils.structured_data import load_collection_manifest, parse_timestamp
 from version import __version__
 
 _SERVICE_NAME = "ChatGPT Desktop"
@@ -154,6 +154,84 @@ def _local_storage_summary(
     prefix = f"{storage_key}: " if isinstance(storage_key, str) and storage_key else ""
     summary = f"{prefix}{text}"
     return summary if len(summary) <= max_length else summary[:max_length] + "…"
+
+
+def _telemetry_requests(value: object) -> dict | None:
+    """Detect ChatGPT Desktop's per-page telemetry buffer.
+
+    Verified against a real ChatGPT Desktop sample: the frontend stores a
+    client-side performance/telemetry log under a plain page-URL Local Storage
+    key (e.g. "https://chatgpt.com"), whose value is ``{"requests": {"request-WEB:<uuid>-<n>": {...}, ...}}``.
+    Without this, ``_local_storage_summary`` above dumps the whole buffer as
+    one opaque JSON string, burying every individual request's fields
+    (turn_trace_id, model_slug, latency metrics, ...) inside a single event.
+    """
+    if not isinstance(value, dict):
+        return None
+    requests = value.get("requests")
+    if not isinstance(requests, dict) or not requests:
+        return None
+    return requests
+
+
+def _telemetry_summary(entry: dict) -> str:
+    bits = [
+        str(entry[key])
+        for key in ("trigger", "result", "model_slug")
+        if entry.get(key)
+    ]
+    first_token_lat = entry.get("first_token_lat")
+    if isinstance(first_token_lat, (int, float)):
+        bits.append(f"first_token={first_token_lat:.0f}ms")
+    return " · ".join(bits) if bits else "telemetry request"
+
+
+def _conversation_list_items(value: object) -> list[dict] | None:
+    """Detect ChatGPT Desktop's cached conversation-list/search index.
+
+    Verified against a real ChatGPT Desktop sample: the frontend caches a
+    paginated conversation list under a Local Storage value shaped like
+    ``{"value": {"pages": [{"items": [{"id", "title", "create_time", ...}, ...]}, ...]}}``
+    (a typical API-response cache wrapper). Each item is a conversation's
+    title/id/timestamps - exactly what an investigator searching by title
+    needs, so it's worth surfacing per-conversation rather than letting it
+    fall into the generic one-blob-per-record dump.
+    """
+    if not isinstance(value, dict):
+        return None
+    inner = value.get("value")
+    if not isinstance(inner, dict):
+        return None
+    pages = inner.get("pages")
+    if not isinstance(pages, list) or not pages:
+        return None
+    items: list[dict] = []
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        page_items = page.get("items")
+        if isinstance(page_items, list):
+            items.extend(item for item in page_items if isinstance(item, dict))
+    return items or None
+
+
+def _draft_prompts(value: object) -> list[dict] | None:
+    """Detect ChatGPT Desktop's per-conversation compose-box draft cache.
+
+    Verified against a real sample: ``{"drafts": [{"id": <conversation_id>,
+    "content": <plain text>, "doc": <rich-text doc>, "timestamp": <unix ms>},
+    ...], "userId": ...}``. This is text the user typed into the input box
+    that may never have been sent - it won't appear in any actual conversation
+    transcript, so it's exactly the kind of evidence a generic blob dump
+    would otherwise bury unread.
+    """
+    if not isinstance(value, dict):
+        return None
+    drafts = value.get("drafts")
+    if not isinstance(drafts, list) or not drafts:
+        return None
+    items = [item for item in drafts if isinstance(item, dict)]
+    return items or None
 
 
 def _iter_conversation_messages(conversation: dict):
@@ -311,11 +389,95 @@ class ChatGPTParser(ArtifactParser):
         for record in result.records:
             if context.cancelled():
                 return
+            timestamp = record.timestamp or fallback_timestamp
+            requests = _telemetry_requests(record.value)
+            if requests is not None:
+                for request_id, entry in requests.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    emit(
+                        NormalizedEvent(
+                            source_id=source.source_id,
+                            parser_id=self.metadata.parser_id,
+                            timestamp=timestamp,
+                            event_type="chatgpt_telemetry_request",
+                            service=_SERVICE_NAME,
+                            session_id=entry.get("turn_session_id") or entry.get("turn_trace_id"),
+                            result=_telemetry_summary(entry),
+                            attribution=AgentAttribution.HIGH,
+                            attribution_score=0.8,
+                            attribution_reasons=("chatgpt_desktop_local_storage_path",),
+                            raw_reference=f"{artifact.record_id}:{record.raw_reference}:{request_id}",
+                            metadata={
+                                "storage_key": record.storage_key,
+                                "request_id": request_id,
+                                "leveldb_seq_number": record.sequence_number,
+                                "is_live": record.is_live,
+                                **entry,
+                                "importance": "low",
+                            },
+                        )
+                    )
+                continue
+            conversations = _conversation_list_items(record.value)
+            if conversations is not None:
+                for item in conversations:
+                    item_id = item.get("id")
+                    item_timestamp = (
+                        parse_timestamp(item.get("create_time")) or timestamp
+                    )
+                    emit(
+                        NormalizedEvent(
+                            source_id=source.source_id,
+                            parser_id=self.metadata.parser_id,
+                            timestamp=item_timestamp,
+                            event_type="chatgpt_conversation_list_item",
+                            service=_SERVICE_NAME,
+                            session_id=item_id if isinstance(item_id, str) else None,
+                            result=item.get("title"),
+                            attribution=AgentAttribution.HIGH,
+                            attribution_score=0.8,
+                            attribution_reasons=("chatgpt_desktop_local_storage_path",),
+                            raw_reference=f"{artifact.record_id}:{record.raw_reference}:{item_id}",
+                            metadata={
+                                "storage_key": record.storage_key,
+                                **item,
+                            },
+                        )
+                    )
+                continue
+            drafts = _draft_prompts(record.value)
+            if drafts is not None:
+                user_id = record.value.get("userId")
+                for draft in drafts:
+                    draft_id = draft.get("id")
+                    emit(
+                        NormalizedEvent(
+                            source_id=source.source_id,
+                            parser_id=self.metadata.parser_id,
+                            timestamp=parse_timestamp(draft.get("timestamp")) or timestamp,
+                            event_type="chatgpt_draft_prompt",
+                            service=_SERVICE_NAME,
+                            session_id=draft_id if isinstance(draft_id, str) else None,
+                            actor="user",
+                            result=draft.get("content"),
+                            attribution=AgentAttribution.HIGH,
+                            attribution_score=0.8,
+                            attribution_reasons=("chatgpt_desktop_local_storage_path",),
+                            raw_reference=f"{artifact.record_id}:{record.raw_reference}:{draft_id}",
+                            metadata={
+                                "storage_key": record.storage_key,
+                                "user_id": user_id,
+                                **draft,
+                            },
+                        )
+                    )
+                continue
             emit(
                 NormalizedEvent(
                     source_id=source.source_id,
                     parser_id=self.metadata.parser_id,
-                    timestamp=record.timestamp or fallback_timestamp,
+                    timestamp=timestamp,
                     event_type="chatgpt_local_storage_record",
                     service=_SERVICE_NAME,
                     result=_local_storage_summary(record.storage_key, record.value),
