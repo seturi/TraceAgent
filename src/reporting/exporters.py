@@ -4,11 +4,13 @@ import csv
 import html as html_lib
 import json
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
+from collection.service_catalog import SERVICE_NAMES
 from core.models import ActorClass, NormalizedEvent
 from version import __version__
 
@@ -113,12 +115,183 @@ class SessionSummaryRow:
 
 
 @dataclass(frozen=True, slots=True)
+class PromptTitleRow:
+    """One user-authored prompt - sent or an unsent draft - matched to the
+    conversation/session title it belongs to.
+
+    Service-agnostic: any parser's actor="user" events are a prompt, and any
+    event of a known title-bearing type supplies the title for its
+    (service, session_id). A session with no title-bearing event (Claude has
+    none today) falls back to its own first prompt as a title, the same
+    convention Codex's own thread-summary already uses. This way every parsed
+    agent shows up here, not just whichever one happens to have a title field.
+    """
+
+    service: str
+    title: str
+    prompt: str
+    sent: bool
+    timestamp: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class CaseReport:
     source_label: str
     generated_at: datetime
     events: tuple[NormalizedEvent, ...]
     file_rows: tuple[FileAttributionRow, ...]
     session_rows: tuple[SessionSummaryRow, ...]
+    prompt_rows: tuple[PromptTitleRow, ...] = ()
+    agent_sections: tuple[AgentReportSection, ...] = ()
+
+
+# Events whose `result` is a session-level label rather than a prompt -
+# ChatGPT's cached conversation title/list entry, Codex's thread-summary row
+# (which itself already prefers an actual `title` column, verified against a
+# real state_*.sqlite `threads` table - see parsers.codex._TABLE_RESULT_COLUMNS),
+# and Claude's own AI-generated session title record (verified against a real
+# ~/.claude/projects/**/*.jsonl sample: `{"type": "ai-title", "aiTitle": "...",
+# "sessionId": "..."}`, surfaced via `payload.get("aiTitle")` in claude_common).
+_TITLE_EVENT_TYPES = (
+    "chatgpt_conversation",
+    "chatgpt_conversation_list_item",
+    "codex_threads_record",
+    "claude_ai-title",
+)
+
+# Prompt events known to represent text typed but never sent, rather than an
+# actual sent message - everything else with actor="user" defaults to sent.
+_UNSENT_EVENT_TYPES = ("chatgpt_draft_prompt",)
+
+
+def _is_tool_plumbing_event(event: NormalizedEvent) -> bool:
+    """True for tool-call/tool-result bookkeeping, even when actor="user".
+
+    Anthropic's API convention wraps ``tool_result`` blocks in a
+    ``role: "user"`` message, so Claude's ``claude_tool_result`` events carry
+    actor="user" despite being tool output (e.g. a grep result), not a
+    human-typed prompt - verified against a real ~/.claude/projects/*.jsonl
+    session where this was polluting the prompt list with file dumps.
+    """
+    event_type = event.event_type.lower()
+    return (
+        "tool_result" in event_type
+        or "tool-result" in event_type
+        or "tool_call" in event_type
+        or "tool_use" in event_type
+        or "function_call" in event_type
+    )
+
+
+def build_prompt_title_rows(events: Iterable[NormalizedEvent]) -> tuple[PromptTitleRow, ...]:
+    titles: dict[tuple[str, str], str] = {}
+    fallback_titles: dict[tuple[str, str], str] = {}
+    prompts: list[tuple[str, str, str, bool, datetime]] = []
+    for event in events:
+        service = event.service or "Unknown"
+        session_id = event.session_id or ""
+        key = (service, session_id)
+        if event.event_type in _TITLE_EVENT_TYPES:
+            if session_id and event.result:
+                titles.setdefault(key, event.result)
+            continue
+        if event.actor == "user" and event.result and not _is_tool_plumbing_event(event):
+            sent = event.event_type not in _UNSENT_EVENT_TYPES
+            prompts.append((service, session_id, event.result, sent, event.timestamp))
+            fallback_titles.setdefault(key, _truncate(event.result, 60))
+
+    rows = [
+        PromptTitleRow(
+            service=service,
+            title=titles.get((service, session_id)) or fallback_titles.get((service, session_id)) or "(untitled)",
+            prompt=prompt,
+            sent=sent,
+            timestamp=timestamp,
+        )
+        for service, session_id, prompt, sent, timestamp in prompts
+    ]
+    rows.sort(key=lambda row: row.timestamp, reverse=True)
+    return tuple(rows)
+
+
+@dataclass(frozen=True, slots=True)
+class AgentReportSection:
+    """One AI agent's slice of the report: its prompts (not interleaved with
+    other agents) plus a template-derived summary of what was exchanged and
+    which actions its tool-call events suggest were performed.
+
+    Every agent in ``collection.service_catalog.SERVICE_NAMES`` gets a
+    section - including ones with no evidence on this source, where
+    ``prompt_rows`` and ``summary_lines`` are both empty - so a reviewer sees
+    at a glance which agents were and weren't found, not just the ones that
+    happened to produce data.
+    """
+
+    service: str
+    prompt_rows: tuple[PromptTitleRow, ...]
+    summary_lines: tuple[str, ...]
+
+
+def _is_tool_call_event(event: NormalizedEvent) -> bool:
+    event_type = event.event_type.lower()
+    if "tool_result" in event_type or "function_call_output" in event_type or "tool-result" in event_type:
+        return False
+    return (
+        "tool_use" in event_type
+        or "tool_call" in event_type
+        or ("function_call" in event_type and "output" not in event_type)
+    )
+
+
+def build_agent_sections(
+    events: Iterable[NormalizedEvent], prompt_rows: Iterable[PromptTitleRow]
+) -> tuple[AgentReportSection, ...]:
+    prompts_by_service: dict[str, list[PromptTitleRow]] = {}
+    for row in prompt_rows:
+        prompts_by_service.setdefault(row.service, []).append(row)
+
+    sessions_by_service: dict[str, set[str]] = {}
+    tool_counts_by_service: dict[str, Counter[str]] = {}
+    actions_by_service: dict[str, list[str]] = {}
+    for event in events:
+        service = event.service or "Unknown"
+        if event.session_id:
+            sessions_by_service.setdefault(service, set()).add(event.session_id)
+        if _is_tool_call_event(event):
+            tool_name = event.tool_name or event.event_type
+            tool_counts_by_service.setdefault(service, Counter())[tool_name] += 1
+            action = event.command or event.path
+            if action:
+                actions_by_service.setdefault(service, []).append(f"{tool_name}: {_truncate(action, 100)}")
+
+    sections: list[AgentReportSection] = []
+    for service in SERVICE_NAMES:
+        rows = tuple(
+            sorted(prompts_by_service.get(service, ()), key=lambda row: row.timestamp, reverse=True)
+        )
+        session_count = len(sessions_by_service.get(service, ()))
+        if not rows and not session_count:
+            sections.append(AgentReportSection(service=service, prompt_rows=(), summary_lines=()))
+            continue
+
+        sent_count = sum(1 for row in rows if row.sent)
+        draft_count = len(rows) - sent_count
+        summary_lines = [
+            f"Sessions: {session_count}  ·  Prompts: {len(rows)} ({sent_count} sent, {draft_count} draft/unsent)"
+        ]
+        tool_counts = tool_counts_by_service.get(service)
+        if tool_counts:
+            top_tools = ", ".join(f"{name} ({count}x)" for name, count in tool_counts.most_common(6))
+            summary_lines.append(f"Tools observed: {top_tools}")
+        actions = actions_by_service.get(service, [])
+        if actions:
+            # De-duplicate while preserving first-seen (chronological) order.
+            distinct_actions = tuple(dict.fromkeys(actions))[:5]
+            summary_lines.append("Inferred actions: " + " / ".join(distinct_actions))
+        sections.append(
+            AgentReportSection(service=service, prompt_rows=rows, summary_lines=tuple(summary_lines))
+        )
+    return tuple(sections)
 
 
 def _actor_label(actor_class: ActorClass, service: str | None) -> str:
@@ -191,6 +364,7 @@ def export_case_report_json(report: CaseReport, destination: Path) -> None:
             "total_events": len(report.events),
             "files_analyzed": len(report.file_rows),
             "sessions": len(report.session_rows),
+            "prompts_by_title": len(report.prompt_rows),
             "by_actor": dict(Counter(row.actor_class.value for row in report.file_rows)),
         },
         "file_activity": [
@@ -217,12 +391,68 @@ def export_case_report_json(report: CaseReport, destination: Path) -> None:
             }
             for row in report.session_rows
         ],
+        "agents": [
+            {
+                "service": section.service,
+                "summary": list(section.summary_lines),
+                "prompts_by_title": [
+                    {
+                        "title": row.title,
+                        "prompt": row.prompt,
+                        "sent": row.sent,
+                        "timestamp": row.timestamp.isoformat(),
+                    }
+                    for row in section.prompt_rows
+                ],
+            }
+            for section in report.agent_sections
+        ],
     }
     destination.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _esc(value: object) -> str:
     return html_lib.escape(str(value)) if value is not None else ""
+
+
+def _truncate(text: str, max_length: int) -> str:
+    return text if len(text) <= max_length else text[:max_length] + "…"
+
+
+def _render_agent_section(section: AgentReportSection) -> str:
+    """One agent's block under "Prompts by Agent". An agent with no evidence
+    on this source renders as just its name - no placeholder table, no "not
+    found" text - so the report still lists every agent TraceAgent knows how
+    to look for, not only the ones that happened to produce data.
+    """
+    header = f'<h3 style="font-size:13px;margin-bottom:4px;">{_esc(section.service)}</h3>'
+    if not section.prompt_rows and not section.summary_lines:
+        return header
+    rows_html = "".join(
+        f'<tr style="background-color:{"#f7f7f7" if index % 2 else "#ffffff"};">'
+        f'<td style="padding:6px 10px;border:1px solid #ccc;">{_esc(row.title)}</td>'
+        f'<td style="padding:6px 10px;border:1px solid #ccc;">{_esc(_fmt_time(row.timestamp))}</td>'
+        f'<td style="padding:6px 10px;border:1px solid #ccc;">{"Sent" if row.sent else "Draft (unsent)"}</td>'
+        f'<td style="padding:6px 10px;border:1px solid #ccc;white-space:pre-wrap;">{_esc(_truncate(row.prompt, 600))}</td>'
+        f"</tr>"
+        for index, row in enumerate(section.prompt_rows)
+    )
+    table = ""
+    if rows_html:
+        table = f"""<table style="border-collapse:collapse;width:100%;font-size:12px;margin-bottom:6px;">
+<tr style="background-color:#eef0f0;">
+<th style="padding:6px 10px;border:1px solid #ccc;text-align:left;">Title</th>
+<th style="padding:6px 10px;border:1px solid #ccc;text-align:left;">When</th>
+<th style="padding:6px 10px;border:1px solid #ccc;text-align:left;">Status</th>
+<th style="padding:6px 10px;border:1px solid #ccc;text-align:left;">Prompt</th>
+</tr>
+{rows_html}
+</table>"""
+    summary_html = ""
+    if section.summary_lines:
+        items = "".join(f"<li>{_esc(line)}</li>" for line in section.summary_lines)
+        summary_html = f'<p style="margin-top:4px;"><b>Summary</b></p><ul style="margin-top:2px;">{items}</ul>'
+    return f'<div style="margin-bottom:16px;">{header}{table}{summary_html}</div>'
 
 
 def render_html_report(report: CaseReport) -> str:
@@ -257,6 +487,7 @@ def render_html_report(report: CaseReport) -> str:
         f"</tr>"
         for index, row in enumerate(report.session_rows)
     )
+    agent_sections_html = "".join(_render_agent_section(section) for section in report.agent_sections)
     actor_summary = "".join(
         f'<li>{_esc(_actor_label(actor, None))}: {count}</li>'
         for actor, count in sorted(actor_counts.items(), key=lambda item: item[0].value)
@@ -277,7 +508,8 @@ TraceAgent version: {_esc(__version__)}
 <h2 style="font-size:15px;border-bottom:1px solid #ccc;padding-bottom:4px;">Summary</h2>
 <p>Total normalized events: {len(report.events)}<br/>
 File/folder entries analyzed: {len(report.file_rows)}<br/>
-Local artifact sessions: {len(report.session_rows)}</p>
+Local artifact sessions: {len(report.session_rows)}<br/>
+Prompts by title: {len(report.prompt_rows)}</p>
 <p><b>By actor</b></p>
 <ul>{actor_summary or "<li>No file/folder attribution results.</li>"}</ul>
 <p><b>By service</b></p>
@@ -309,6 +541,15 @@ What happened to each file, who most likely did it, and the evidence behind that
 </tr>
 {session_rows_html or '<tr><td style="padding:6px 10px;border:1px solid #ccc;" colspan="5">No local artifact sessions.</td></tr>'}
 </table>
+
+<h2 style="font-size:15px;border-bottom:1px solid #ccc;padding-bottom:4px;">Prompts by Agent</h2>
+<p style="color:#5b6268;font-size:11px;">
+Every user-authored prompt (sent or left as an unsent draft), grouped by AI agent rather than
+interleaved by time, each followed by a summary of what was exchanged and which actions its
+tool-call events suggest were performed. Agents not found on this evidence source are listed
+with no content below their name.
+</p>
+{agent_sections_html}
 
 <p style="color:#868d92;font-size:11px;margin-top:18px;">
 Generated by TraceAgent {_esc(__version__)}. All evidence sources were accessed read-only;

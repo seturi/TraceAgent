@@ -118,7 +118,7 @@ def claude_record_events(
     if not events:
         result = _text_value(content)
         if result is None:
-            result = _text_value(payload.get("result") or payload.get("lastPrompt"))
+            result = _text_value(payload.get("result") or payload.get("lastPrompt") or payload.get("aiTitle"))
         event_type = _record_event_type(record_type, payload)
         events.append(
             NormalizedEvent(

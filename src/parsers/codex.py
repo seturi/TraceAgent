@@ -208,11 +208,14 @@ def _derive_display(
     return None, None, None
 
 
-# Verified against real state_*.sqlite `threads` / logs_*.sqlite `logs` tables:
-# these columns hold actual human-readable content, in priority order, so
-# prefer them over the generic key=value dump.
+# Verified against a real state_*.sqlite `threads` table: `title` is a short
+# auto-generated summary distinct from `first_user_message` (the full raw
+# prompt text) - e.g. title="test3 폴더 생성" vs.
+# first_user_message="C:\Users\...\Project 폴더에 test3 폴더를 생성해줘".
+# `title` must come first, or the real title is never used since
+# first_user_message is NOT NULL and therefore always non-empty.
 _TABLE_RESULT_COLUMNS = {
-    "threads": ("first_user_message", "title", "preview"),
+    "threads": ("title", "first_user_message", "preview"),
     "logs": ("feedback_log_body",),
 }
 

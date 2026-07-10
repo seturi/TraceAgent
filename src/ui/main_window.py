@@ -58,6 +58,8 @@ from reporting.exporters import (
     CaseReport,
     FileAttributionRow,
     SessionSummaryRow,
+    build_agent_sections,
+    build_prompt_title_rows,
     export_activity_csv,
     export_case_report_json,
     export_html_report,
@@ -1336,12 +1338,15 @@ class MainWindow(QMainWindow):
             )
             for entry in getattr(self, "_sessions", {}).values()
         )
+        prompt_rows = build_prompt_title_rows(self.parsed_events)
         return CaseReport(
             source_label=self.current_source.label if self.current_source else "Unknown source",
             generated_at=datetime.now(timezone.utc),
             events=self.parsed_events,
             file_rows=file_rows,
             session_rows=session_rows,
+            prompt_rows=prompt_rows,
+            agent_sections=build_agent_sections(self.parsed_events, prompt_rows),
         )
 
     @staticmethod
