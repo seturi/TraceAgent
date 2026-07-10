@@ -65,6 +65,69 @@ def _sanitize_payload(payload: dict) -> dict:
     return sanitized
 
 
+# Codex's own session-event stream (``event_msg``) names shell/patch/MCP tool
+# invocations as *_begin / *_end pairs (see codex-rs's protocol.rs event enum) —
+# this hasn't been verified against a captured real session, so it's applied as
+# a naming-convention match rather than an exact enum, and always degrades to
+# the generic payload dump (_payload_fallback) if the guess is wrong.
+_TOOL_FAMILY_HINTS = ("exec_command", "exec", "command", "patch", "mcp_tool_call", "web_search")
+
+
+def _event_msg_tool_family(sub_type: str) -> str | None:
+    """Short tool-family name (e.g. "exec_command") for a *_begin/*_end event_msg."""
+    for suffix in ("_begin", "_end"):
+        if sub_type.endswith(suffix):
+            base = sub_type[: -len(suffix)]
+            if any(hint in base for hint in _TOOL_FAMILY_HINTS):
+                return base
+    return None
+
+
+def _reasoning_text(payload: dict) -> str | None:
+    """Text of a Responses-API ``reasoning`` item: a list of summary parts."""
+    summary = payload.get("summary")
+    if isinstance(summary, list):
+        texts = [
+            part.get("text")
+            for part in summary
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ]
+        if texts:
+            return "\n".join(texts)
+    text = payload.get("text")
+    return text if isinstance(text, str) else None
+
+
+_COMMAND_FIELDS = ("command", "cmd", "invocation", "changes")
+_OUTPUT_FIELDS = ("aggregated_output", "output", "stdout", "result")
+
+
+def _first_text_field(payload: dict, fields: tuple[str, ...]) -> str | None:
+    for field in fields:
+        value = payload.get(field)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, list) and value:
+            joined = " ".join(str(item) for item in value)
+            if joined:
+                return joined
+    return None
+
+
+def _payload_fallback(payload: dict, *, max_length: int = 1500) -> str | None:
+    """Readable stand-in for event_msg/response_item sub-types this parser
+    doesn't extract dedicated fields for (task lifecycle, approvals, token
+    counts, plan updates, etc.) — indented JSON instead of a blank event body.
+    """
+    if not payload:
+        return None
+    try:
+        text = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    except (TypeError, ValueError):
+        text = str(payload)
+    return text if len(text) <= max_length else text[:max_length] + "…"
+
+
 def _derive_actor(record_type: str, payload: dict) -> str | None:
     if record_type == "response_item":
         role = payload.get("role")
@@ -75,12 +138,16 @@ def _derive_actor(record_type: str, payload: dict) -> str | None:
             return "assistant"
         if sub_type == "function_call_output":
             return "tool"
+        if sub_type == "reasoning":
+            return "assistant"
     if record_type == "event_msg":
-        sub_type = payload.get("type")
+        sub_type = payload.get("type") or ""
         if sub_type == "user_message":
             return "user"
-        if sub_type == "agent_message":
+        if sub_type in ("agent_message", "agent_message_delta", "agent_reasoning", "agent_reasoning_delta"):
             return "assistant"
+        if _event_msg_tool_family(sub_type):
+            return "tool" if sub_type.endswith("_end") else "assistant"
     return None
 
 
@@ -120,11 +187,24 @@ def _derive_display(
         if sub_type == "function_call_output":
             output = payload.get("output")
             return None, None, (output if isinstance(output, str) else None)
+        if sub_type == "reasoning":
+            return None, None, _reasoning_text(payload)
     if record_type == "event_msg":
-        sub_type = payload.get("type")
+        sub_type = payload.get("type") or ""
         if sub_type in ("user_message", "agent_message"):
             message = payload.get("message")
             return None, None, (message if isinstance(message, str) else None)
+        if sub_type == "agent_message_delta":
+            delta = payload.get("delta")
+            return None, None, (delta if isinstance(delta, str) else None)
+        if sub_type in ("agent_reasoning", "agent_reasoning_delta"):
+            text = payload.get("text") or payload.get("delta")
+            return None, None, (text if isinstance(text, str) else None)
+        family = _event_msg_tool_family(sub_type)
+        if family:
+            if sub_type.endswith("_begin"):
+                return family, _first_text_field(payload, _COMMAND_FIELDS), None
+            return family, None, _first_text_field(payload, _OUTPUT_FIELDS)
     return None, None, None
 
 
@@ -424,10 +504,22 @@ class CodexParser(ArtifactParser):
                     current_session_id = payload.get("session_id") or current_session_id
 
                 sub_type = payload.get("type") if record_type in ("event_msg", "response_item") else None
-                event_type = f"codex_{record_type}.{sub_type}" if sub_type else f"codex_{record_type}"
+                tool_family = _event_msg_tool_family(sub_type) if record_type == "event_msg" and sub_type else None
+                if tool_family:
+                    # Give exec/patch/mcp *_begin/*_end pairs a tool_call/tool_result
+                    # event_type (not just codex_event_msg.<sub_type>) so the UI's
+                    # generic kind classifier recognizes them like Claude's tool blocks.
+                    kind = "tool_call" if sub_type.endswith("_begin") else "tool_result"
+                    event_type = f"codex_{kind}.{tool_family}"
+                elif sub_type:
+                    event_type = f"codex_{record_type}.{sub_type}"
+                else:
+                    event_type = f"codex_{record_type}"
                 timestamp = parse_timestamp(record.get("timestamp")) or fallback_timestamp
                 sanitized = _sanitize_payload(payload)
                 tool_name, command, result = _derive_display(record_type, payload, sanitized)
+                if tool_name is None and command is None and result is None:
+                    result = _payload_fallback(sanitized)
 
                 emit(
                     NormalizedEvent(

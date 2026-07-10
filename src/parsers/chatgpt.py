@@ -92,19 +92,46 @@ def _content_fallback(content: object, *, max_length: int = 1500) -> str | None:
     images, etc.) whose exact shape hasn't been verified against a real sample.
 
     Rather than guessing per-content_type field names, this labels the block with
-    its content_type and dumps it as JSON, so the event body is never blank even
-    when it isn't a plain-text message.
+    its content_type and dumps it as indented JSON (so it reads as fields on
+    separate lines, not one run-on string), ensuring the event body is never
+    blank even when it isn't a plain-text message.
     """
     if not isinstance(content, dict) or not content:
         return None
     content_type = content.get("content_type")
     try:
-        text = json.dumps(content, ensure_ascii=False, default=str)
+        text = json.dumps(content, ensure_ascii=False, indent=2, default=str)
     except (TypeError, ValueError):
         text = str(content)
-    prefix = f"[{content_type}] " if isinstance(content_type, str) else ""
+    prefix = f"[{content_type}]\n" if isinstance(content_type, str) else ""
     summary = f"{prefix}{text}"
     return summary if len(summary) <= max_length else summary[:max_length] + "…"
+
+
+def _classify_message(message: dict, author: dict, content: dict) -> tuple[str, str | None]:
+    """Map ChatGPT's author role / recipient / content_type onto the same
+    tool-call / tool-result / thinking vocabulary the Claude parsers use
+    (``claude_tool_call`` etc. in :mod:`parsers.claude_common`), so the UI's
+    event-kind classifier (``ui.main_window._event_kind``) recognizes ChatGPT's
+    tool invocations and reasoning the same way it recognizes Claude's, instead
+    of every non-user/assistant message collapsing into a generic "event".
+
+    Returns ``(event_type, tool_name)``.
+    """
+    content_type = content.get("content_type")
+    role = author.get("role")
+    recipient = message.get("recipient")
+
+    if content_type == "reasoning_recap":
+        return "chatgpt_thinking", None
+    if role == "tool":
+        # A tool/plugin/code-interpreter response, addressed back to the model.
+        tool_name = author.get("name") or (recipient if recipient not in (None, "all") else None)
+        return "chatgpt_tool_result", tool_name
+    if role == "assistant" and recipient not in (None, "all"):
+        # An assistant turn addressed to a tool/plugin instead of the user.
+        return "chatgpt_tool_call", recipient
+    return "chatgpt_conversation_message", None
 
 
 def _local_storage_summary(
@@ -367,18 +394,25 @@ class ChatGPTParser(ArtifactParser):
                     message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
                 )
                 text = _extract_text(content)
+                event_type, tool_name = _classify_message(message, author, content)
+                is_tool_call = event_type == "chatgpt_tool_call"
+                body = text or _content_fallback(content)
+                command = body if is_tool_call else None
+                result = None if is_tool_call else body
                 message_timestamp = _from_unix(message.get("create_time")) or base_timestamp
                 emit(
                     NormalizedEvent(
                         source_id=source.source_id,
                         parser_id=self.metadata.parser_id,
                         timestamp=message_timestamp,
-                        event_type="chatgpt_conversation_message",
+                        event_type=event_type,
                         path=record.url,
                         service=_SERVICE_NAME,
                         session_id=conversation_id,
                         actor=author.get("role"),
-                        result=text or _content_fallback(content),
+                        tool_name=tool_name,
+                        command=command,
+                        result=result,
                         attribution=AgentAttribution.HIGH,
                         attribution_score=0.85,
                         attribution_reasons=("chatgpt_desktop_cache_conversation_json",),

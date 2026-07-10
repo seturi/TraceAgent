@@ -146,24 +146,38 @@ _CSV_FIELDS = (
 )
 
 
-def export_file_activity_csv(report: CaseReport, destination: Path) -> None:
-    """Per-file/folder activity report: what happened, by whom, and why we think so."""
+_SESSION_CSV_FIELDS = ("service", "session_id", "event_count", "first_activity", "last_activity")
+
+
+def export_activity_csv(report: CaseReport, destination: Path) -> None:
+    """Human-readable activity report: file/folder attribution, then local
+    artifact sessions, as two labeled sections in one CSV — so a case with
+    only service artifacts (no NTFS) still exports something, and vice versa.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("w", newline="", encoding="utf-8-sig") as stream:
-        writer = csv.DictWriter(stream, fieldnames=_CSV_FIELDS)
-        writer.writeheader()
+        writer = csv.writer(stream)
+        writer.writerow(["# File / Folder Activity"])
+        writer.writerow(_CSV_FIELDS)
         for row in report.file_rows:
             writer.writerow(
-                {
-                    "filename": row.filename,
-                    "path": row.path,
-                    "actor": _actor_label(row.actor_class, row.service),
-                    "confidence": f"{row.confidence:.2f}",
-                    "activity": _activity_summary(row.behaviors),
-                    "evidence": _evidence_summary(row.reasons, limit=len(row.reasons) or 1),
-                    "first_activity": _fmt_time(row.first_activity),
-                    "last_activity": _fmt_time(row.last_activity),
-                }
+                (
+                    row.filename,
+                    row.path,
+                    _actor_label(row.actor_class, row.service),
+                    f"{row.confidence:.2f}",
+                    _activity_summary(row.behaviors),
+                    _evidence_summary(row.reasons, limit=len(row.reasons) or 1),
+                    _fmt_time(row.first_activity),
+                    _fmt_time(row.last_activity),
+                )
+            )
+        writer.writerow([])
+        writer.writerow(["# Local Artifact Sessions"])
+        writer.writerow(_SESSION_CSV_FIELDS)
+        for row in report.session_rows:
+            writer.writerow(
+                (row.service, row.session_id, row.event_count, _fmt_time(row.first), _fmt_time(row.last))
             )
 
 

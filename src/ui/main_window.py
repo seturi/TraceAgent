@@ -58,8 +58,8 @@ from reporting.exporters import (
     CaseReport,
     FileAttributionRow,
     SessionSummaryRow,
+    export_activity_csv,
     export_case_report_json,
-    export_file_activity_csv,
     export_html_report,
     render_html_report,
 )
@@ -1346,11 +1346,13 @@ class MainWindow(QMainWindow):
         destination = self._ensure_suffix(path, ".csv")
         report = self._build_case_report()
         try:
-            export_file_activity_csv(report, destination)
+            export_activity_csv(report, destination)
         except OSError as exc:
             QMessageBox.critical(self, "Export", f"Unable to write CSV: {exc}")
             return
-        self.statusBar().showMessage(f"Exported {len(report.file_rows)} file activity row(s) to {destination}")
+        self.statusBar().showMessage(
+            f"Exported {len(report.file_rows)} file activity + {len(report.session_rows)} session row(s) to {destination}"
+        )
 
     def _export_json(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Export JSON", "", "JSON files (*.json)")
