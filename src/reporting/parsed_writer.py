@@ -24,14 +24,14 @@ def write_parsed_events(
         temporary = destination.with_suffix(".jsonl.partial")
         with temporary.open("w", encoding="utf-8", newline="\n") as stream:
             for event in service_events:
-                stream.write(json.dumps(_event_payload(event), ensure_ascii=False, default=str))
+                stream.write(json.dumps(event_payload(event), ensure_ascii=False, default=str))
                 stream.write("\n")
         temporary.replace(destination)
         outputs.append(destination)
     return tuple(outputs)
 
 
-def _event_payload(event: NormalizedEvent) -> dict[str, object]:
+def event_payload(event: NormalizedEvent) -> dict[str, object]:
     return {
         "event_id": event.event_id,
         "source_id": event.source_id,

@@ -7,7 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QTextDocument
+from PySide6.QtPrintSupport import QPrinter
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -53,6 +54,15 @@ from core.models import (
 )
 from parsers.base import ParseContext
 from parsers.registry import ParserRegistry
+from reporting.exporters import (
+    CaseReport,
+    FileAttributionRow,
+    SessionSummaryRow,
+    export_case_report_json,
+    export_file_activity_csv,
+    export_html_report,
+    render_html_report,
+)
 from reporting.parsed_writer import write_parsed_events
 from utils.case_paths import CasePaths, create_case_paths
 from utils.evidence_access import SourceAccessError, open_evidence_accessor
@@ -134,10 +144,19 @@ class MainWindow(QMainWindow):
         file_menu.addAction(exit_action)
 
         export_menu = self.menuBar().addMenu("Export")
-        for label in ("CSV…", "JSON…", "HTML Report…", "PDF Report…"):
+        self.export_actions: dict[str, QAction] = {}
+        export_specs = (
+            ("csv", "CSV…", self._export_csv),
+            ("json", "JSON…", self._export_json),
+            ("html", "HTML Report…", self._export_html_report),
+            ("pdf", "PDF Report…", self._export_pdf_report),
+        )
+        for key, label, handler in export_specs:
             action = QAction(label, self)
             action.setEnabled(False)
+            action.triggered.connect(handler)
             export_menu.addAction(action)
+            self.export_actions[key] = action
 
         help_menu = self.menuBar().addMenu("Help")
         about_action = QAction("About", self)
@@ -853,6 +872,8 @@ class MainWindow(QMainWindow):
         self.ntfs_verdicts = outcome.verdicts
         self.parsed_events = tuple(sorted(outcome.events, key=lambda event: event.timestamp))
         self._populate_analyze_views()
+        for action in self.export_actions.values():
+            action.setEnabled(bool(self.parsed_events))
         if self.ntfs_verdicts:
             self.parse_log.append(
                 f"[NTFS attribution] {len(self.ntfs_verdicts)} file operation(s) classified: "
@@ -968,6 +989,7 @@ class MainWindow(QMainWindow):
                 + [e.timestamp for e in entry["logs"]]
                 + [e.timestamp for e in entry["mft"]]
             )
+            entry["first"] = min(times) if times else None
             entry["last"] = max(times) if times else None
             # When the path is unresolved, fall back to the recovered file name
             # (from $LogFile/$MFT/USN records) rather than the internal event id.
@@ -1271,6 +1293,106 @@ class MainWindow(QMainWindow):
             "About TraceAgent",
             f"TraceAgent {__version__}\n\nCollection, parser orchestration, NTFS timeline analysis, and AI-agent attribution.",
         )
+
+    # -- Export ----------------------------------------------------------------
+    def _build_case_report(self) -> CaseReport:
+        file_rows = tuple(
+            FileAttributionRow(
+                filename=entry["filename"] or "—",
+                path=entry["path"] or "—",
+                actor_class=entry["actor"],
+                service=entry["service"],
+                confidence=entry["confidence"],
+                behaviors=(
+                    tuple(verdict.behavior for verdict in entry["ops"])
+                    if entry["ops"]
+                    else (("logfile_recovered",) if entry["logs"] else ())
+                ),
+                reasons=tuple(
+                    dict.fromkeys(reason for verdict in entry["ops"] for reason in verdict.reasons)
+                ),
+                first_activity=entry["first"],
+                last_activity=entry["last"],
+            )
+            for entry in getattr(self, "_file_entries", ())
+        )
+        session_rows = tuple(
+            SessionSummaryRow(
+                service=entry["service"],
+                session_id=entry["session_id"],
+                event_count=len(entry["events"]),
+                first=entry["first"],
+                last=entry["last"],
+            )
+            for entry in getattr(self, "_sessions", {}).values()
+        )
+        return CaseReport(
+            source_label=self.current_source.label if self.current_source else "Unknown source",
+            generated_at=datetime.now(timezone.utc),
+            events=self.parsed_events,
+            file_rows=file_rows,
+            session_rows=session_rows,
+        )
+
+    @staticmethod
+    def _ensure_suffix(path: str, suffix: str) -> Path:
+        candidate = Path(path)
+        return candidate if candidate.suffix.lower() == suffix else candidate.with_suffix(suffix)
+
+    def _export_csv(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Export CSV", "", "CSV files (*.csv)")
+        if not path:
+            return
+        destination = self._ensure_suffix(path, ".csv")
+        report = self._build_case_report()
+        try:
+            export_file_activity_csv(report, destination)
+        except OSError as exc:
+            QMessageBox.critical(self, "Export", f"Unable to write CSV: {exc}")
+            return
+        self.statusBar().showMessage(f"Exported {len(report.file_rows)} file activity row(s) to {destination}")
+
+    def _export_json(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Export JSON", "", "JSON files (*.json)")
+        if not path:
+            return
+        destination = self._ensure_suffix(path, ".json")
+        report = self._build_case_report()
+        try:
+            export_case_report_json(report, destination)
+        except OSError as exc:
+            QMessageBox.critical(self, "Export", f"Unable to write JSON: {exc}")
+            return
+        self.statusBar().showMessage(f"Exported {len(report.file_rows)} file activity row(s) to {destination}")
+
+    def _export_html_report(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Export HTML Report", "", "HTML files (*.html)")
+        if not path:
+            return
+        destination = self._ensure_suffix(path, ".html")
+        try:
+            export_html_report(self._build_case_report(), destination)
+        except OSError as exc:
+            QMessageBox.critical(self, "Export", f"Unable to write HTML report: {exc}")
+            return
+        self.statusBar().showMessage(f"Exported HTML report to {destination}")
+
+    def _export_pdf_report(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Export PDF Report", "", "PDF files (*.pdf)")
+        if not path:
+            return
+        destination = self._ensure_suffix(path, ".pdf")
+        document = QTextDocument()
+        document.setHtml(render_html_report(self._build_case_report()))
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setOutputFormat(QPrinter.PdfFormat)
+        printer.setOutputFileName(str(destination))
+        try:
+            document.print_(printer)
+        except OSError as exc:
+            QMessageBox.critical(self, "Export", f"Unable to write PDF report: {exc}")
+            return
+        self.statusBar().showMessage(f"Exported PDF report to {destination}")
 
 
 def _is_admin() -> bool:
