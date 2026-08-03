@@ -10,6 +10,8 @@ from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
+from analysis.ntfs.narrative import behavior_label as _bilingual_behavior_label
+from analysis.ntfs.narrative import reason_phrase
 from collection.service_catalog import SERVICE_NAMES
 from core.models import ActorClass, NormalizedEvent
 from version import __version__
@@ -24,6 +26,9 @@ class ExportFormat(StrEnum):
 
 # Internal behavior/reason codes (see analysis.ntfs.signatures / analysis.ntfs.attribution)
 # translated into phrases an investigator can read without knowing the codebase.
+# The wording lives in analysis.ntfs.narrative so the report and the UI say the
+# same thing about the same evidence; only the past-tense report phrasing of the
+# behavior codes is local to this module.
 _BEHAVIOR_LABELS = {
     "create": "Created",
     "modify": "Modified",
@@ -36,33 +41,13 @@ _BEHAVIOR_LABELS = {
     "logfile_recovered": "Recovered from $LogFile",
 }
 
-_REASON_LABELS = {
-    "interactive_app_temp": "interactive application temp file",
-    "recycle_bin_move": "Recycle Bin move",
-    "os_or_app_background_path": "OS/application background activity",
-    "atomic_tmp_rename_write": "atomic temp-file-then-rename write (AI-agent pattern)",
-    "data_truncate_add_overwrite": "truncate-then-rewrite pattern",
-    "object_id_then_data": "object-ID change followed by data write",
-    "copy_with_basic_info_change": "copy with attribute change",
-    "permanent_delete_ambiguous": "permanent delete, actor not determinable from filesystem alone",
-    "direct_operation_ambiguous": "direct operation, actor not determinable from filesystem alone",
-    "no_strong_signature": "no strong signature",
-    "session_log_path_match": "session-log path match",
-    "session_log_basename_match": "session-log filename match",
-    "session_log_command_match": "session-log command match",
-    "tool": "tool",
-    "signature_service_conflict": "conflicts with the filesystem signature",
-}
-
 
 def _behavior_label(code: str) -> str:
-    return _BEHAVIOR_LABELS.get(code, code)
+    return _BEHAVIOR_LABELS.get(code, _bilingual_behavior_label(code, "en"))
 
 
 def _reason_label(code: str) -> str:
-    base, _, detail = code.partition(":")
-    label = _REASON_LABELS.get(base, base.replace("_", " "))
-    return f"{label} ({detail})" if detail else label
+    return reason_phrase(code, "en")
 
 
 def _activity_summary(behaviors: tuple[str, ...]) -> str:
@@ -101,6 +86,10 @@ class FileAttributionRow:
     reasons: tuple[str, ...]
     first_activity: datetime | None
     last_activity: datetime | None
+    # Plain-language reading of the reconstructed flow, from
+    # analysis.ntfs.narrative — what actually happened, not which bits were set.
+    interpretation_ko: str = ""
+    interpretation_en: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,6 +301,8 @@ _CSV_FIELDS = (
     "path",
     "actor",
     "confidence",
+    "interpretation_ko",
+    "interpretation_en",
     "activity",
     "evidence",
     "first_activity",
@@ -339,6 +330,8 @@ def export_activity_csv(report: CaseReport, destination: Path) -> None:
                     row.path,
                     _actor_label(row.actor_class, row.service),
                     f"{row.confidence:.2f}",
+                    row.interpretation_ko,
+                    row.interpretation_en,
                     _activity_summary(row.behaviors),
                     _evidence_summary(row.reasons, limit=len(row.reasons) or 1),
                     _fmt_time(row.first_activity),
@@ -374,6 +367,7 @@ def export_case_report_json(report: CaseReport, destination: Path) -> None:
                 "actor_class": row.actor_class.value,
                 "service": row.service,
                 "confidence": round(row.confidence, 3),
+                "interpretation": {"ko": row.interpretation_ko, "en": row.interpretation_en},
                 "activity": _activity_summary(row.behaviors),
                 "evidence": _evidence_summary(row.reasons, limit=len(row.reasons) or 1),
                 "first_activity": row.first_activity.isoformat() if row.first_activity else None,
@@ -471,7 +465,9 @@ def render_html_report(report: CaseReport) -> str:
         f'<br/><span style="color:#868d92;font-size:10px;font-family:Consolas,monospace;">{_esc(row.path)}</span></td>'
         f'<td style="padding:6px 10px;border:1px solid #ccc;">{_esc(_actor_label(row.actor_class, row.service))}'
         f'<br/><span style="color:#868d92;font-size:10px;">confidence {row.confidence:.2f}</span></td>'
-        f'<td style="padding:6px 10px;border:1px solid #ccc;">{_esc(_activity_summary(row.behaviors))}</td>'
+        f'<td style="padding:6px 10px;border:1px solid #ccc;">{_esc(row.interpretation_ko)}'
+        f'<br/><span style="color:#5b6268;font-size:11px;">{_esc(row.interpretation_en)}</span>'
+        f'<br/><span style="color:#868d92;font-size:10px;">{_esc(_activity_summary(row.behaviors))}</span></td>'
         f'<td style="padding:6px 10px;border:1px solid #ccc;font-size:11px;">{_esc(_evidence_summary(row.reasons))}</td>'
         f'<td style="padding:6px 10px;border:1px solid #ccc;">{_esc(_fmt_time(row.last_activity))}</td>'
         f"</tr>"
@@ -518,12 +514,14 @@ Prompts by title: {len(report.prompt_rows)}</p>
 <h2 style="font-size:15px;border-bottom:1px solid #ccc;padding-bottom:4px;">File / Folder Activity</h2>
 <p style="color:#5b6268;font-size:11px;">
 What happened to each file, who most likely did it, and the evidence behind that call.
+The interpretation column reads the reconstructed NTFS flow back as plain language
+(Korean, then English), with the internal behavior codes underneath.
 </p>
 <table style="border-collapse:collapse;width:100%;font-size:12px;">
 <tr style="background-color:#eef0f0;">
 <th style="padding:6px 10px;border:1px solid #ccc;text-align:left;">File</th>
 <th style="padding:6px 10px;border:1px solid #ccc;text-align:left;">Actor</th>
-<th style="padding:6px 10px;border:1px solid #ccc;text-align:left;">Activity</th>
+<th style="padding:6px 10px;border:1px solid #ccc;text-align:left;">Interpretation / 해석</th>
 <th style="padding:6px 10px;border:1px solid #ccc;text-align:left;">Evidence</th>
 <th style="padding:6px 10px;border:1px solid #ccc;text-align:left;">Last activity</th>
 </tr>

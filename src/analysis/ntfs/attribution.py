@@ -16,6 +16,7 @@ from datetime import datetime
 
 from analysis.attribution import score_attribution
 from analysis.ntfs.events import NTFS_PARSER_ID
+from analysis.ntfs.narrative import Narrative, describe_operation
 from analysis.ntfs.signatures import (
     ActorSignal,
     FileOperation,
@@ -66,6 +67,9 @@ class OperationVerdict:
     event_ids: tuple[str, ...]
     matched_event_id: str | None = None
     metadata: dict[str, object] = field(default_factory=dict)
+    # Plain-language (Korean/English) reading of what this operation actually
+    # was — see :mod:`analysis.ntfs.narrative`.
+    narrative: Narrative | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,6 +357,15 @@ def _verdict_for(
             event_ids=op.event_ids,
             matched_event_id=activity.event_id,
             metadata={"session_id": activity.session_id, "match_kind": kind},
+            narrative=describe_operation(
+                op,
+                actor_class=ActorClass.AI_AGENT,
+                behavior=signal.behavior,
+                service=activity.service,
+                reasons=result.reasons,
+                matched_tool=activity.tool_name,
+                matched_session=activity.session_id,
+            ),
         )
 
     # No cross-analysis hit: fall back to the signature layer.
@@ -374,6 +387,13 @@ def _verdict_for(
         end=op.end,
         event_ids=op.event_ids,
         metadata={"service_hints": list(signal.service_hints)},
+        narrative=describe_operation(
+            op,
+            actor_class=signal.actor_class,
+            behavior=signal.behavior,
+            service=service,
+            reasons=signal.reasons,
+        ),
     )
 
 

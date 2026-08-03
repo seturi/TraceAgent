@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from analysis.ntfs.attribution import OperationVerdict, attribute_ntfs_events, build_agent_index
+from analysis.ntfs.narrative import Narrative, summarize_file
 from analysis.ntfs.signatures import basename_of, normalize_path
 from collection.artifact_collector import ServiceArtifactCollector
 from collection.base import CollectionContext
@@ -472,8 +473,22 @@ class MainWindow(QMainWindow):
         self.ntfs_count = QLabel("No NTFS operations classified yet.", objectName="Muted")
         left_layout.addWidget(self.ntfs_count)
         self.ntfs_table = self._table(
-            ("Filename", "Path", "Actor", "Service", "Operations", "Last activity"), 1
+            (
+                "Filename",
+                "Path",
+                "Actor",
+                "해석 / Interpretation",
+                "Service",
+                "Operations",
+                "Last activity",
+            ),
+            3,
         )
+        # Interpretation is the column worth the space, so it takes the stretch.
+        # Paths would otherwise size to their longest entry and push it off-screen,
+        # so give Path a fixed starting width the user can drag.
+        self.ntfs_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Interactive)
+        self.ntfs_table.setColumnWidth(1, 300)
         self.ntfs_table.setSortingEnabled(True)
         self.ntfs_table.itemSelectionChanged.connect(self._show_ntfs_detail)
         left_layout.addWidget(self.ntfs_table, 1)
@@ -1006,6 +1021,7 @@ class MainWindow(QMainWindow):
             entry["path"] = entry["path"] or recovered or key
             entry["filename"] = basename_of(entry["path"]) or recovered or entry["path"]
             entry["key"] = key
+            entry["narrative"] = _entry_narrative(entry)
 
         self._file_by_key = entries
         self._file_entries = sorted(
@@ -1199,10 +1215,12 @@ class MainWindow(QMainWindow):
         row = table.rowCount()
         table.insertRow(row)
         last = entry["last"]
+        narrative = entry.get("narrative")
         values = (
             entry["filename"] or "—",
             entry["path"] or "—",
             _actor_class_label(entry["actor"], entry["service"]),
+            _truncate(narrative.headline_ko, 110) if narrative else "—",
             entry["service"] or "—",
             str(len(entry["ops"]) + len(entry["logs"]) + len(entry.get("mft", []))),
             _format_local_datetime(last, "%Y-%m-%d %H:%M:%S") if last else "—",
@@ -1210,6 +1228,10 @@ class MainWindow(QMainWindow):
         for column, value in enumerate(values):
             item = QTableWidgetItem(str(value))
             item.setData(Qt.UserRole, f"file:{entry['key']}")
+            if narrative is not None:
+                # The cell holds the Korean headline (elided); the tooltip carries
+                # both languages in full so nothing is lost to truncation.
+                item.setToolTip(narrative.bilingual())
             table.setItem(row, column, item)
 
     def _show_ntfs_detail(self) -> None:
@@ -1232,9 +1254,15 @@ class MainWindow(QMainWindow):
             f"Verdict       : {_actor_class_label(entry['actor'], entry['service'])}"
             f"   (confidence {entry['confidence']:.2f})",
             f"Activity      : {len(ops)} operation(s), {len(mft)} $MFT, {len(logs)} $LogFile record(s)",
-            "",
-            "── Activity timeline ──",
         ]
+        narrative = entry.get("narrative")
+        if narrative is not None:
+            lines += ["", "══ 해석 / Interpretation ══", ""]
+            lines += ["[한국어]", f"  {narrative.headline_ko}"]
+            lines += [f"    {line}" for line in narrative.detail_ko]
+            lines += ["", "[English]", f"  {narrative.headline_en}"]
+            lines += [f"    {line}" for line in narrative.detail_en]
+        lines += ["", "── Activity timeline ──"]
         if not ops:
             recovered = ", ".join(s for s, present in (("$MFT", mft), ("$LogFile", logs)) if present)
             lines.append(f"  (no USN operations — recovered from {recovered or 'other artifacts'})")
@@ -1243,11 +1271,16 @@ class MainWindow(QMainWindow):
                 f"{_format_local_datetime(verdict.start, '%Y-%m-%d %H:%M:%S')}  "
                 f"[{_actor_class_label(verdict.actor_class, verdict.service)}]  {verdict.behavior}"
             )
+            if verdict.narrative is not None:
+                lines.append(f"    ▸ {verdict.narrative.headline_ko}")
+                lines.append(f"    ▸ {verdict.narrative.headline_en}")
+                for line in verdict.narrative.detail_ko:
+                    lines.append(f"      {line}")
+                for line in verdict.narrative.detail_en:
+                    lines.append(f"      {line}")
             flow = self._operation_flow(verdict)
             if flow:
-                lines.append(f"    flow: {flow}")
-            if verdict.reasons:
-                lines.append(f"    evidence: {', '.join(verdict.reasons[:3])}")
+                lines.append(f"    raw USN flow: {flow}")
             if verdict.matched_event_id:
                 matched = self._event_by_id.get(verdict.matched_event_id)
                 if matched is not None:
@@ -1325,6 +1358,8 @@ class MainWindow(QMainWindow):
                 ),
                 first_activity=entry["first"],
                 last_activity=entry["last"],
+                interpretation_ko=entry["narrative"].headline_ko if entry.get("narrative") else "",
+                interpretation_en=entry["narrative"].headline_en if entry.get("narrative") else "",
             )
             for entry in getattr(self, "_file_entries", ())
         )
@@ -1605,8 +1640,34 @@ def _local_haystack(event: NormalizedEvent) -> str:
     )
 
 
+def _entry_narrative(entry: dict) -> Narrative:
+    """Interpret everything known about one file/folder as a bilingual summary."""
+    ops = entry["ops"]
+    return summarize_file(
+        display_name=entry["filename"] or entry["path"] or "(unknown)",
+        actor_class=entry["actor"],
+        service=entry["service"],
+        narratives=tuple(v.narrative for v in ops if v.narrative is not None),
+        behaviors=tuple(verdict.behavior for verdict in ops),
+        mft_count=len(entry.get("mft", [])),
+        logfile_count=len(entry["logs"]),
+        logfile_operations=tuple(
+            str(event.metadata.get("operation"))
+            for event in entry["logs"]
+            if event.metadata.get("operation")
+        ),
+        matched_service=(
+            entry["matched"].service if entry.get("matched") is not None else None
+        ),
+    )
+
+
 def _entry_haystack(entry: dict) -> str:
-    return f"{entry.get('path') or ''} {entry.get('filename') or ''}".lower()
+    """Searchable text for an entry — path, name and both interpretations, so a
+    plain-language search ("휴지통", "atomic", "timestomping") finds the file."""
+    narrative = entry.get("narrative")
+    interpretation = f"{narrative.headline_ko} {narrative.headline_en}" if narrative else ""
+    return f"{entry.get('path') or ''} {entry.get('filename') or ''} {interpretation}".lower()
 
 
 def _entry_has_behavior(entry: dict, behavior: str) -> bool:
