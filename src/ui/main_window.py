@@ -75,6 +75,7 @@ from version import __version__
 SERVICES = ("All services", "Claude Cowork", "Claude Code", "ChatGPT Desktop", "Antigravity", "Codex")
 LOCAL_SERVICES = ("Claude Cowork", "Claude Code", "ChatGPT Desktop", "Antigravity", "Codex")
 NTFS_ACTORS = ("All actors", "AI agent", "Human", "System", "Unknown")
+NTFS_ITEM_TYPES = ("Files and folders", "Files only", "Folders only")
 NTFS_BEHAVIORS = (
     "All behaviors",
     "create",
@@ -454,6 +455,14 @@ class MainWindow(QMainWindow):
         self.ntfs_actor.addItems(NTFS_ACTORS)
         self.ntfs_actor.currentIndexChanged.connect(self._refresh_ntfs_events)
         filters.addWidget(self.ntfs_actor)
+        self.ntfs_item_type = QComboBox()
+        self.ntfs_item_type.addItems(NTFS_ITEM_TYPES)
+        self.ntfs_item_type.setToolTip(
+            "Directories get USN records too (shell folder creation, cache buckets),\n"
+            "and on a busy volume they outnumber file activity."
+        )
+        self.ntfs_item_type.currentIndexChanged.connect(self._refresh_ntfs_events)
+        filters.addWidget(self.ntfs_item_type)
         self.ntfs_behavior = QComboBox()
         self.ntfs_behavior.addItems(NTFS_BEHAVIORS)
         self.ntfs_behavior.currentIndexChanged.connect(self._refresh_ntfs_events)
@@ -475,6 +484,7 @@ class MainWindow(QMainWindow):
         self.ntfs_table = self._table(
             (
                 "Filename",
+                "Type",
                 "Path",
                 "Actor",
                 "해석 / Interpretation",
@@ -482,13 +492,13 @@ class MainWindow(QMainWindow):
                 "Operations",
                 "Last activity",
             ),
-            3,
+            4,
         )
         # Interpretation is the column worth the space, so it takes the stretch.
         # Paths would otherwise size to their longest entry and push it off-screen,
         # so give Path a fixed starting width the user can drag.
-        self.ntfs_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Interactive)
-        self.ntfs_table.setColumnWidth(1, 300)
+        self.ntfs_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Interactive)
+        self.ntfs_table.setColumnWidth(2, 300)
         self.ntfs_table.setSortingEnabled(True)
         self.ntfs_table.itemSelectionChanged.connect(self._show_ntfs_detail)
         left_layout.addWidget(self.ntfs_table, 1)
@@ -1021,6 +1031,11 @@ class MainWindow(QMainWindow):
             entry["path"] = entry["path"] or recovered or key
             entry["filename"] = basename_of(entry["path"]) or recovered or entry["path"]
             entry["key"] = key
+            # Directory-ness comes from FILE_ATTRIBUTE_DIRECTORY on the USN
+            # records, or $MFT's $FILE_NAME flags — never guessed from the name.
+            entry["is_dir"] = any(verdict.is_directory for verdict in ops) or any(
+                event.metadata.get("is_dir") is True for event in entry.get("mft", [])
+            )
             entry["narrative"] = _entry_narrative(entry)
 
         self._file_by_key = entries
@@ -1184,12 +1199,17 @@ class MainWindow(QMainWindow):
         table.setRowCount(0)
         needle = self.ntfs_search.text().strip().lower()
         actor = self.ntfs_actor.currentText()
+        item_type = self.ntfs_item_type.currentText()
         behavior = self.ntfs_behavior.currentText()
         hide_system = self.ntfs_hide_system.isChecked()
         entries = getattr(self, "_file_entries", ())
         matched = 0
         for entry in entries:
             if hide_system and entry["actor"] == ActorClass.SYSTEM:
+                continue
+            if item_type == "Files only" and entry.get("is_dir"):
+                continue
+            if item_type == "Folders only" and not entry.get("is_dir"):
                 continue
             if actor != "All actors" and _actor_class_name(entry["actor"]) != actor:
                 continue
@@ -1218,6 +1238,7 @@ class MainWindow(QMainWindow):
         narrative = entry.get("narrative")
         values = (
             entry["filename"] or "—",
+            "Folder" if entry.get("is_dir") else "File",
             entry["path"] or "—",
             _actor_class_label(entry["actor"], entry["service"]),
             _truncate(narrative.headline_ko, 110) if narrative else "—",
@@ -1649,6 +1670,7 @@ def _entry_narrative(entry: dict) -> Narrative:
         service=entry["service"],
         narratives=tuple(v.narrative for v in ops if v.narrative is not None),
         behaviors=tuple(verdict.behavior for verdict in ops),
+        is_directory=entry.get("is_dir"),
         mft_count=len(entry.get("mft", [])),
         logfile_count=len(entry["logs"]),
         logfile_operations=tuple(

@@ -29,6 +29,7 @@ from core.models import ActorClass, AgentAttribution, NormalizedEvent
 _TERMINATORS = {"File_Closed", "File_Deleted"}
 DEFAULT_WINDOW_SECONDS = 5.0
 _TIGHT_WINDOW_SECONDS = 2.0
+_FILE_ATTRIBUTE_DIRECTORY = 0x10
 
 _AI_SERVICES = {
     "Claude Cowork",
@@ -66,6 +67,7 @@ class OperationVerdict:
     end: datetime
     event_ids: tuple[str, ...]
     matched_event_id: str | None = None
+    is_directory: bool = False
     metadata: dict[str, object] = field(default_factory=dict)
     # Plain-language (Korean/English) reading of what this operation actually
     # was — see :mod:`analysis.ntfs.narrative`.
@@ -133,7 +135,11 @@ def _build_operation(events: list[NormalizedEvent]) -> FileOperation:
     filenames: list[str] = []
     paths: list[str] = []
     refs: list[int] = []
+    is_directory = False
     for event in ordered:
+        attributes = event.metadata.get("file_attributes")
+        if isinstance(attributes, int) and attributes & _FILE_ATTRIBUTE_DIRECTORY:
+            is_directory = True
         reason_flow.extend(str(r) for r in event.metadata.get("ntfs_reasons", []))
         name = event.metadata.get("filename")
         if isinstance(name, str) and name and name not in filenames:
@@ -158,6 +164,7 @@ def _build_operation(events: list[NormalizedEvent]) -> FileOperation:
         end=max(e.timestamp for e in ordered),
         file_references=tuple(refs),
         event_ids=tuple(e.event_id for e in ordered),
+        is_directory=is_directory,
     )
 
 
@@ -228,6 +235,7 @@ def _combine(a: FileOperation, b: FileOperation) -> FileOperation:
         end=max(a.end, b.end),
         file_references=tuple(dict.fromkeys(a.file_references + b.file_references)),
         event_ids=tuple(dict.fromkeys(a.event_ids + b.event_ids)),
+        is_directory=a.is_directory or b.is_directory,
     )
 
 
@@ -356,6 +364,7 @@ def _verdict_for(
             end=op.end,
             event_ids=op.event_ids,
             matched_event_id=activity.event_id,
+            is_directory=op.is_directory,
             metadata={"session_id": activity.session_id, "match_kind": kind},
             narrative=describe_operation(
                 op,
@@ -386,6 +395,7 @@ def _verdict_for(
         start=op.start,
         end=op.end,
         event_ids=op.event_ids,
+        is_directory=op.is_directory,
         metadata={"service_hints": list(signal.service_hints)},
         narrative=describe_operation(
             op,

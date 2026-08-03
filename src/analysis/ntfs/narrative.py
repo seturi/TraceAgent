@@ -28,7 +28,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from analysis.ntfs.signatures import FileOperation, has_app_temp, has_tmp_rename
+from analysis.ntfs.signatures import (
+    FileOperation,
+    has_app_temp,
+    has_download_temp,
+    has_tmp_rename,
+    is_user_doc_path,
+)
 from core.models import ActorClass
 
 Language = str  # "ko" | "en"
@@ -99,6 +105,18 @@ REASON_PHRASES: dict[str, tuple[str, str]] = {
         "속성까지 함께 복제된 복사",
         "copy with attribute change",
     ),
+    "copy_ambiguous": (
+        "복사 — 파일시스템 기록만으로는 행위자 판별 불가",
+        "copy, actor not determinable from filesystem alone",
+    ),
+    "directory_operation": (
+        "폴더 조작 — 내용 쓰기 시그니처를 적용할 수 없음",
+        "directory operation, content-write signatures do not apply",
+    ),
+    "unresolved_path": (
+        "경로 미해석 — 배경 활동 여부를 배제할 수 없음",
+        "path unresolved, background activity cannot be excluded",
+    ),
     "permanent_delete_ambiguous": (
         "완전 삭제 — 파일시스템 기록만으로는 행위자 판별 불가",
         "permanent delete, actor not determinable from filesystem alone",
@@ -108,6 +126,10 @@ REASON_PHRASES: dict[str, tuple[str, str]] = {
         "direct operation, actor not determinable from filesystem alone",
     ),
     "no_strong_signature": ("뚜렷한 시그니처 없음", "no strong signature"),
+    "browser_or_messenger_download": (
+        "브라우저·메신저의 다운로드 중 임시 이름",
+        "browser/messenger in-progress download marker",
+    ),
     "session_log_path_match": (
         "에이전트 세션 로그의 경로 일치",
         "session-log path match",
@@ -213,14 +235,17 @@ class _Target:
     en: str  # 'the file "report.docx"'
 
 
-def _target_of(name: str) -> _Target:
+def _target_of(name: str, is_directory: bool | None = None) -> _Target:
     """Build the target phrases for ``name``.
 
     Placing a Korean noun ("파일"/"폴더") before the particle keeps the particle
     fixed, so a file name ending in any character — Hangul, Latin, digit — still
-    reads naturally without per-name particle inflection.
+    reads naturally without per-name particle inflection.  ``is_directory`` comes
+    from FILE_ATTRIBUTE_DIRECTORY when known; the extension check is only a
+    fallback for names recovered without their attributes.
     """
-    if "." not in name.strip("."):
+    folder = is_directory if is_directory is not None else ("." not in name.strip("."))
+    if folder:
         noun_ko, obj, topic, noun_en = "폴더", "를", "는", "folder"
     else:
         noun_ko, obj, topic, noun_en = "파일", "을", "은", "file"
@@ -291,6 +316,18 @@ def _interpret(op: FileOperation, behavior: str) -> _Interpretation:
             "a trace left only when a person opens a document in the desktop application, edits it and saves.",
         )
 
+    if has_download_temp(op) and is_user_doc_path(op):
+        return _Interpretation(
+            "download_completed",
+            "{target_o} 웹 브라우저 또는 메신저를 통해 내려받았습니다.",
+            "downloaded {target} through a web browser or messenger",
+            "전송 중 임시 이름(.crdownload/.part 등)으로 만들어진 뒤 완료 시점에 최종 이름으로 바뀌었습니다. "
+            "사람이 다운로드 UI를 조작할 때만 남는 흔적으로, 파일 API로 직접 파일을 쓰는 AI 에이전트는 이 형태를 만들지 않습니다.",
+            "It was created under an in-progress name (.crdownload/.part) and renamed to its final name on "
+            "completion — a trace left only when a person drives a download UI. An AI agent writing through a file "
+            "API never produces this shape.",
+        )
+
     if behavior == "delete_recycle":
         return _Interpretation(
             "recycle_delete",
@@ -334,9 +371,11 @@ def _interpret(op: FileOperation, behavior: str) -> _Interpretation:
             "{target_o} 다른 위치에서 복사해 왔습니다.",
             "created {target} as a copy of another file",
             "파일이 만들어진 직후 내용이 한 번에 덮어써지고 타임스탬프·속성까지 함께 맞춰졌습니다. "
-            "새로 작성한 것이 아니라 기존 파일을 복사해 온 동작의 특징입니다.",
+            "새로 작성한 것이 아니라 기존 파일을 복사해 온 동작입니다. 다만 탐색기 복사·설치 프로그램·에이전트의 복사 호출이 "
+            "모두 같은 흔적을 남기므로, 누가 복사했는지는 이 흐름만으로 판단할 수 없습니다.",
             "Right after creation the contents were overwritten in one go and the timestamps/attributes were set to "
-            "match — the signature of copying an existing file rather than authoring a new one.",
+            "match — the file was copied rather than authored. Explorer copy/paste, an installer and an agent's copy "
+            "call all leave this same trace, so the flow alone does not say who did it.",
         )
 
     if behavior == "move":
@@ -523,7 +562,7 @@ def describe_operation(
     """Interpret one reconstructed file operation as a bilingual narrative."""
     interpretation = _interpret(op, behavior)
     actor_ko, actor_en = _actor_phrase(actor_class, service)
-    target = _target_of(_display_name(op))
+    target = _target_of(_display_name(op), op.is_directory)
 
     headline_ko = (
         f"{actor_ko} "
@@ -579,6 +618,7 @@ def summarize_file(
     logfile_count: int = 0,
     logfile_operations: tuple[str, ...] = (),
     matched_service: str | None = None,
+    is_directory: bool | None = None,
 ) -> Narrative:
     """Roll every operation on one file/folder up into a single interpretation.
 
@@ -587,7 +627,7 @@ def summarize_file(
     *can* be said, rather than leaving the entry blank.
     """
     actor_ko, actor_en = _actor_phrase(actor_class, service)
-    target = _target_of(display_name)
+    target = _target_of(display_name, is_directory)
 
     if len(narratives) == 1:
         base = narratives[0]

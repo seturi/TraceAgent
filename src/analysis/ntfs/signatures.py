@@ -32,6 +32,13 @@ _DIRECT_WRITE_FAMILY = (CHATGPT, CODEX)
 _WORD_TEMP = re.compile(r"^~wr[dl]\d+\.tmp$", re.IGNORECASE)
 _OFFICE_LOCK = re.compile(r"^~\$.+\.(docx?|xlsx?|pptx?)$", re.IGNORECASE)
 _RECYCLE_META = re.compile(r"^\$[ir][0-9a-z]{4,}", re.IGNORECASE)
+# In-progress download markers written by browsers and messenger clients, which
+# rename to the final name once the transfer completes.  Only a person driving a
+# download UI produces these — an agent writing a file through a file API never
+# does — so inside a user download/document tree they are a positive human
+# signal, covering the most common real user activity (browser downloads,
+# KakaoTalk/Telegram file receipts) that Office/Recycle Bin signatures miss.
+_DOWNLOAD_TEMP = re.compile(r"\.(crdownload|part|partial|download|opdownload)$", re.IGNORECASE)
 _RECYCLE_RENAME = re.compile(r"^\$r[0-9a-z]+\.", re.IGNORECASE)
 
 # Paths that indicate OS / application background activity rather than a person
@@ -39,16 +46,24 @@ _RECYCLE_RENAME = re.compile(r"^\$r[0-9a-z]+\.", re.IGNORECASE)
 # LevelDB and the like constantly perform atomic tmp->rename writes that would
 # otherwise be mistaken for AI agent activity, so anything under these roots is
 # treated as background unless it also sits under a user document location.
-_BACKGROUND_PATH_HINTS = (
+# Roots that hold OS and application storage.  A user document never lives under
+# any of these, so they are background *unconditionally* — the user-document
+# escape below must not apply to them.  It matters: "/onedrive/" is a user
+# document hint (C:\Users\x\OneDrive\Documents), but it also matches the OneDrive
+# *application* directory under AppData, which would otherwise let every OneDrive
+# cache write escape the background filter and be read as agent activity.
+_APPLICATION_STORAGE_HINTS = (
     "/windows/",
     "/program files/",
     "/program files (x86)/",
     "/programdata/",
-    "/$recycle.bin/",
     "/system volume information/",
     "/$extend/",
     "/appdata/",
 )
+# Background only when the operation is not also under a user document tree: a
+# deleted user document does sit in the Recycle Bin, and that is user activity.
+_BACKGROUND_PATH_HINTS = ("/$recycle.bin/",)
 # Background even when nominally under a user document tree (app cache churn).
 _BACKGROUND_ANYWHERE_HINTS = (
     "/ebwebview/",
@@ -60,9 +75,27 @@ _BACKGROUND_ANYWHERE_HINTS = (
     "/indexeddb/",
     "/blob_storage/",
     "/cache_data/",
+    "/accountpictures/",
 )
+# OS / application-owned files: registry hives and their transaction logs, shell
+# metadata, icon and thumbnail caches, error reports, LevelDB internals, and
+# GUID-named temp files.  These are background churn *wherever* they sit — a
+# "copy" of desktop.ini into Documents is the shell materialising a folder, not
+# a person or an agent handling a document — so they are matched by name, ahead
+# of any path-based reasoning, and are recognised even when the record's parent
+# reference could not be resolved to a path.
 _BACKGROUND_FILENAMES = re.compile(
-    r"^(log|log\.old|local state|.*\.ldb|.*\.log|manifest-\d+|current)$", re.IGNORECASE
+    r"""^(?:
+        log | log\.old | local\ state | current | lock | manifest-\d+
+      | desktop\.ini | thumbs\.db
+      | pagefile\.sys | swapfile\.sys | hiberfil\.sys
+      | ntuser\.(?:dat|ini)[^\\/]* | usrclass\.dat[^\\/]*
+      | iconcache[^\\/]*\.db | thumbcache[^\\/]*\.db
+      | report\.wer(?:\.tmp)?
+      | [^\\/]*\.(?:ldb|log\d*|regtrans-ms|blf|etl|evtx|pf)
+      | \{?[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\}?\.tmp
+    )$""",
+    re.IGNORECASE | re.VERBOSE,
 )
 
 # Paths a person typically operates on interactively.
@@ -126,6 +159,8 @@ class FileOperation:
     end: datetime
     file_references: tuple[int, ...]
     event_ids: tuple[str, ...]
+    # FILE_ATTRIBUTE_DIRECTORY was set on the USN records for this operation.
+    is_directory: bool = False
 
     @property
     def reasons(self) -> frozenset[str]:
@@ -161,6 +196,11 @@ def has_app_temp(op: FileOperation) -> str | None:
     return None
 
 
+def has_download_temp(op: FileOperation) -> bool:
+    """Whether a browser/messenger in-progress download marker is present."""
+    return _any_filename(op, lambda n: bool(_DOWNLOAD_TEMP.search(n)))
+
+
 def has_recycle_bin(op: FileOperation) -> bool:
     if any("/$recycle.bin/" in path for path in op.paths):
         return True
@@ -190,11 +230,14 @@ def is_user_doc_path(op: FileOperation) -> bool:
 def is_background_path(op: FileOperation) -> bool:
     """Whether the operation targets OS / application background storage.
 
-    App-cache locations (``_BACKGROUND_ANYWHERE_HINTS``) count as background even
-    inside a user profile; general system roots only count when the operation is
+    App-cache locations (``_BACKGROUND_ANYWHERE_HINTS``), OS/application storage
+    roots (``_APPLICATION_STORAGE_HINTS``) and OS-owned file names count as
+    background unconditionally; the Recycle Bin only counts when the operation is
     not also under a user document tree.
     """
     if any(hint in path for path in op.paths for hint in _BACKGROUND_ANYWHERE_HINTS):
+        return True
+    if any(hint in path for path in op.paths for hint in _APPLICATION_STORAGE_HINTS):
         return True
     if _any_filename(op, lambda n: bool(_BACKGROUND_FILENAMES.match(n))):
         return True
@@ -239,6 +282,14 @@ def evaluate(op: FileOperation) -> ActorSignal:
             metadata={"application": app},
         )
 
+    if has_download_temp(op) and is_user_doc_path(op):
+        return ActorSignal(
+            ActorClass.HUMAN,
+            behavior,
+            0.7,
+            reasons=("browser_or_messenger_download",),
+        )
+
     if behavior == "delete_recycle":
         # Recycle-bin move: a person via Explorer, or any non-Cowork agent.
         # Claude Cowork runs in a Linux sandbox and *cannot* use the recycle bin.
@@ -262,6 +313,30 @@ def evaluate(op: FileOperation) -> ActorSignal:
             behavior,
             0.6,
             reasons=("os_or_app_background_path",),
+        )
+
+    # --- Directories ----------------------------------------------------------
+    # Every signature below reads the shape of a *file content* write.  A
+    # directory produces the same reason bits from index churn (shell folder
+    # creation, temp directories, cache buckets) without the same meaning, so
+    # claiming an actor from them is unfounded; leave it to session-log
+    # correlation, which can still confirm a genuine agent folder operation.
+    if op.is_directory:
+        return ActorSignal(
+            ActorClass.UNKNOWN, behavior, 0.15, reasons=("directory_operation",)
+        )
+
+    # --- Unresolved location --------------------------------------------------
+    # Without a path there is no way to tell whether this sits in a user document
+    # tree or in OS/application storage, and the write-shape signatures below are
+    # only meaningful once background churn has been excluded — on real evidence
+    # they fire almost exclusively on Windows internals whose parent reference the
+    # $MFT copy could not resolve.  Session-log correlation (Layer 2) matches on
+    # file name and command text, so a genuine agent operation is still
+    # recoverable here.
+    if not op.paths:
+        return ActorSignal(
+            ActorClass.UNKNOWN, behavior, 0.15, reasons=("unresolved_path",)
         )
 
     # --- AI atomic-write signatures ------------------------------------------
@@ -295,16 +370,23 @@ def evaluate(op: FileOperation) -> ActorSignal:
             reasons=("object_id_then_data",),
         )
 
+    # --- Weak / ambiguous -----------------------------------------------------
     if behavior == "copy":
+        # A copy preserves the source's timestamps whoever performs it, so
+        # Explorer's Ctrl+C/Ctrl+V, an installer and an agent's copy call are
+        # indistinguishable from the flow alone — the same argument this module
+        # already makes for permanent deletes.  Asserting AI here is what floods
+        # the view: on real evidence a single `npm install` contributed 1,491
+        # "AI agent" copies under node_modules.  The service hints are kept so
+        # session-log correlation can still resolve it.
         return ActorSignal(
-            ActorClass.AI_AGENT,
+            ActorClass.UNKNOWN,
             behavior,
-            0.5,
+            0.25,
             service_hints=(CLAUDE_CODE, ANTIGRAVITY, CODEX),
-            reasons=("copy_with_basic_info_change",),
+            reasons=("copy_ambiguous",),
         )
 
-    # --- Weak / ambiguous -----------------------------------------------------
     if behavior == "delete_permanent":
         # rm (agent) vs Shift+Delete (human) are indistinguishable from NTFS
         # alone; leave it to cross-analysis to decide.

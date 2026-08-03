@@ -26,6 +26,9 @@ from utils.structured_data import file_timestamp
 from version import __version__
 
 _USN_GLOBS = ("**/ntfs_usnjrnl__*.bin", "**/$J")
+# $J is written in 4 KiB pages and a USN record never spans a page boundary, so
+# a page boundary is the safe place to resync after damaged data.
+_USN_PAGE = 0x1000
 
 
 class NtfsUsnParser(ArtifactParser):
@@ -73,7 +76,18 @@ class NtfsUsnParser(ArtifactParser):
             mft_path = artifact.metadata.get("mft_path")
             mft = Path(mft_path) if isinstance(mft_path, str) and mft_path else None
             try:
-                views = _read_usn_records(journal, mft)
+                views, damaged = _read_usn_records(journal, mft)
+                if damaged:
+                    # Surfaced as a parser warning rather than silently dropped:
+                    # a wrapped or over-extracted $J routinely contains torn
+                    # regions, and the investigator should know how much of the
+                    # journal could not be read.
+                    errors.append(
+                        {
+                            "path": str(journal),
+                            "error": f"{damaged} damaged page(s) skipped while reading $J",
+                        }
+                    )
                 events = usn_records_to_events(views, source_id=source.source_id)
                 for event in events:
                     if context.cancelled():
@@ -110,42 +124,129 @@ def _sibling_mft(journal: Path) -> Path | None:
     return None
 
 
-def _read_usn_records(journal: Path, mft: Path | None) -> list[UsnRecordView]:
+def _read_usn_records(journal: Path, mft: Path | None) -> tuple[list[UsnRecordView], int]:
+    """Read every recoverable record from ``$J``; also report damaged pages."""
     from dissect.ntfs.ntfs import NTFS
 
     mft_stream = mft.open("rb") if mft is not None else None
     journal_stream = journal.open("rb")
     try:
         ntfs = NTFS(mft=mft_stream, usnjrnl=journal_stream)
+        resolve_parent = _parent_path_resolver(ntfs)
         views: list[UsnRecordView] = []
         fallback = file_timestamp(journal)
-        for record in ntfs.usnjrnl.records():
-            views.append(_to_view(record, fallback))
+        damaged = 0
+        for record, bad_pages in _iter_usn_records(ntfs.usnjrnl, journal.stat().st_size):
+            damaged += bad_pages
+            if record is not None:
+                views.append(_to_view(record, fallback, resolve_parent))
         views.sort(key=lambda view: view.usn)
-        return views
+        return views, damaged
     finally:
         journal_stream.close()
         if mft_stream is not None:
             mft_stream.close()
 
 
-def _to_view(record, fallback) -> UsnRecordView:
+def _iter_usn_records(usnjrnl, size: int):
+    """Walk ``$J`` page by page, tolerating torn and non-USN regions.
+
+    ``dissect``'s own ``UsnJrnl.records()`` guards only ``EOFError``: the first
+    record with an unrecognised version raises ``ValueError`` out of the
+    generator, which then cannot be resumed — so a single damaged record
+    discards the *entire* journal (observed on real evidence: 345k valid records
+    lost to one bad offset where the extraction ran past the end of the $J
+    stream).  A wrapped journal, or one extracted with slack attached, routinely
+    contains such regions, so walk the pages ourselves and resync on the next
+    page boundary instead of giving up.
+
+    Yields ``(record_or_None, damaged_pages)`` so the caller can both collect
+    records and count what had to be skipped.
+    """
+    from dissect.ntfs.usnjrnl import UsnRecord
+
+    fh = usnjrnl.fh
+    offset = 0
+    while offset < size:
+        fh.seek(offset)
+        head = fh.read(4)
+        if len(head) < 4:
+            break
+        if head == b"\x00\x00\x00\x00":
+            offset += _USN_PAGE - (offset % _USN_PAGE)  # sparse/unused page
+            continue
+        try:
+            record = UsnRecord(usnjrnl, fh, offset)
+            length = int(record.record.RecordLength)
+        except Exception:  # noqa: BLE001 - torn or non-USN data
+            offset += _USN_PAGE - (offset % _USN_PAGE)
+            yield None, 1
+            continue
+        # A record lives wholly inside its page; anything else is garbage length.
+        if not 0 < length <= _USN_PAGE - (offset % _USN_PAGE) or offset + length > size:
+            offset += _USN_PAGE - (offset % _USN_PAGE)
+            yield None, 1
+            continue
+        if record.header.MajorVersion == 2:
+            yield record, 0
+        offset += length
+        if offset % 8:
+            offset += -offset & 7
+
+
+def _parent_path_resolver(ntfs):
+    """Return a cached parent-reference -> directory-path resolver.
+
+    ``UsnRecord.full_path`` walks the parent chain through the $MFT for *every*
+    record; with hundreds of thousands of records sharing a few thousand parent
+    directories that is the dominant cost of parsing a real journal.  Caching by
+    (segment, sequence) keeps the sequence-number check that detects a parent
+    slot which has since been reused — such a reference resolves to ``None``
+    (unresolved) rather than to a wrong, confidently-stated folder.
+    """
+    cache: dict[tuple[int, int], str | None] = {}
+
+    def resolve(reference) -> str | None:
+        from dissect.ntfs.util import segment_reference
+
+        if reference is None:
+            return None
+        try:
+            key = (int(segment_reference(reference)), int(reference.SequenceNumber))
+        except Exception:  # noqa: BLE001
+            return None
+        if key in cache:
+            return cache[key]
+        segment, sequence = key
+        try:
+            record = ntfs.mft(segment)
+            path = record.full_path() if record.header.SequenceNumber == sequence else None
+        except Exception:  # noqa: BLE001
+            path = None
+        cache[key] = path
+        return path
+
+    return resolve
+
+
+def _to_view(record, fallback, resolve_parent) -> UsnRecordView:
     from dissect.ntfs.util import segment_reference
 
     try:
         timestamp = record.timestamp
     except Exception:  # noqa: BLE001
         timestamp = fallback
-    try:
-        full_path = record.full_path
-    except Exception:  # noqa: BLE001
-        full_path = None
+    filename = getattr(record, "filename", None)
+    parent_path = resolve_parent(_safe_attr(record, "ParentFileReferenceNumber", None))
+    # The volume root resolves to an empty path, so test for None (unresolved)
+    # rather than falsiness — otherwise every root-level file loses its path.
+    full_path = f"{parent_path}\\{filename}" if parent_path is not None and filename else None
     return UsnRecordView(
         usn=int(_safe_attr(record, "Usn", 0)),
         timestamp=timestamp or fallback,
         file_reference=_reference(record, "FileReferenceNumber", segment_reference),
         parent_reference=_reference(record, "ParentFileReferenceNumber", segment_reference),
-        filename=getattr(record, "filename", None),
+        filename=filename,
         full_path=full_path,
         reason_flags=decompose_reason(int(_safe_attr(record, "Reason", 0))),
         source_info=(),
