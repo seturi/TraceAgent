@@ -17,6 +17,7 @@ from utils.structured_data import (
     load_collection_manifest,
     parse_timestamp,
     read_json_object,
+    sniff_proto_timestamp,
 )
 from version import __version__
 
@@ -222,13 +223,43 @@ class AntigravityParser(ArtifactParser):
         path = Path(artifact.path)
         fallback = file_timestamp(path)
         session_id = path.stem
-        for row in iter_sqlite_rows(path):
+        # steps.idx is shared with gen_metadata/executor_metadata (each such
+        # row is a sidecar to one step), but those sidecar tables carry no
+        # timestamp of their own anywhere in their protobuf blobs - only
+        # steps does. Materializing the file so steps can be indexed by idx
+        # before the sidecar rows are emitted lets them borrow their parent
+        # step's real time instead of falling all the way back to the .db
+        # file's mtime (iter_sqlite_rows yields tables alphabetically, so
+        # executor_metadata/gen_metadata arrive before steps in one pass).
+        rows = list(iter_sqlite_rows(path))
+        step_timestamps: dict[int, Any] = {}
+        for row in rows:
+            if row.table != "steps":
+                continue
+            idx = row.values.get("idx")
+            if not isinstance(idx, int):
+                continue
+            timestamp = _timestamp_from_mapping(row.values) or _timestamp_from_blobs(row.raw_values)
+            if timestamp is not None:
+                step_timestamps[idx] = timestamp
+        for row in rows:
             if context.cancelled():
                 return
             values = row.values
             if row.table == "trajectory_meta" and values.get("trajectory_id"):
                 session_id = str(values["trajectory_id"])
-            timestamp = _timestamp_from_mapping(values) or fallback
+            idx = values.get("idx")
+            sibling_timestamp = (
+                step_timestamps.get(idx)
+                if row.table != "steps" and isinstance(idx, int)
+                else None
+            )
+            timestamp = (
+                _timestamp_from_mapping(values)
+                or _timestamp_from_blobs(row.raw_values)
+                or sibling_timestamp
+                or fallback
+            )
             step_type = values.get("step_type") if row.table == "steps" else None
             emit(
                 NormalizedEvent(
@@ -320,6 +351,20 @@ def _timestamp_from_mapping(values: dict[str, Any]) -> Any:
     for key, value in values.items():
         if "time" in key.lower() or key.lower().endswith("_at"):
             if (timestamp := parse_timestamp(value)) is not None:
+                return timestamp
+    return None
+
+
+def _timestamp_from_blobs(raw_values: dict[str, Any]) -> Any:
+    """Antigravity's per-step creation time lives inside protobuf BLOB
+    columns (``steps.metadata`` etc.), not a plain timestamp column - see
+    ``sniff_proto_timestamp``. Without this, every row in a table with no
+    plain time column falls back to the .db file's mtime, collapsing many
+    real, distinct action times onto one wrong timestamp.
+    """
+    for value in raw_values.values():
+        if isinstance(value, (bytes, bytearray)):
+            if (timestamp := sniff_proto_timestamp(value)) is not None:
                 return timestamp
     return None
 

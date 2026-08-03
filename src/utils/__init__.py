@@ -36,6 +36,7 @@ from utils.structured_data import (
     load_collection_manifest,
     parse_timestamp,
     read_json_object,
+    sniff_proto_timestamp,
     sqlite_tables,
 )
 
@@ -71,6 +72,7 @@ __all__ = [
     "load_collection_manifest",
     "parse_timestamp",
     "read_json_object",
+    "sniff_proto_timestamp",
     "sqlite_tables",
     "try_parse_json",
 ]

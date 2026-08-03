@@ -145,6 +145,37 @@ def basename_of(path: str | None) -> str | None:
     return normalized.rstrip("/").rsplit("/", 1)[-1] or None
 
 
+# Each AI agent's own local-artifact storage (see collection.service_catalog's
+# ServiceArtifactSpec.user_patterns) is under continuous read/write churn just
+# from the agent app running - housekeeping saves, WAL/SHM files, atomic
+# tmp-then-rename state writes. NTFS/USN scanning is volume-wide and has no
+# notion of "this directory belongs to an already-parsed local artifact
+# source", so without this filter that churn floods File/Folder Activity
+# looking like the agent editing user files, when it never touched anything
+# outside its own app-data directory.
+_SERVICE_OWNED_PATH_MARKERS = (
+    "/.gemini/antigravity/",
+    "/.claude/projects/",
+    "/local-agent-mode-sessions/",
+    "/claude/claude-code-sessions/",
+    "/claude/logs/",
+    "/claude-cli-nodejs/cache/",
+    "/chatgpt-desktop/local storage/leveldb/",
+    "/chatgpt-desktop/cache/cache_data/",
+    "/chatgpt/local storage/leveldb/",
+    "/chatgpt/cache/cache_data/",
+    "/.codex/",
+)
+
+
+def is_service_owned_path(path: str | None) -> bool:
+    """Whether ``path`` sits inside an AI agent's own local-artifact storage."""
+    normalized = normalize_path(path)
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in _SERVICE_OWNED_PATH_MARKERS)
+
+
 @dataclass(frozen=True, slots=True)
 class FileOperation:
     """One logical file/folder action reconstructed from USN records."""

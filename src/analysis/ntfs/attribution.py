@@ -22,6 +22,7 @@ from analysis.ntfs.signatures import (
     FileOperation,
     basename_of,
     evaluate,
+    is_service_owned_path,
     normalize_path,
 )
 from core.models import ActorClass, AgentAttribution, NormalizedEvent
@@ -412,8 +413,18 @@ def attribute_ntfs_events(
     *,
     window_seconds: float = DEFAULT_WINDOW_SECONDS,
 ) -> AttributionOutcome:
-    """Attribute every NTFS operation and return updated events plus verdicts."""
-    events = tuple(events)
+    """Attribute every NTFS operation and return updated events plus verdicts.
+
+    NTFS events under an AI agent's own local-artifact storage (see
+    :func:`is_service_owned_path`) are dropped entirely rather than attributed:
+    that churn is the agent app maintaining its own state, not activity on the
+    user's files, and including it would flood File/Folder Activity with noise.
+    """
+    events = tuple(
+        e
+        for e in events
+        if not (e.parser_id.startswith("ntfs.") and is_service_owned_path(e.path))
+    )
     ntfs_events = [e for e in events if e.parser_id == NTFS_PARSER_ID]
     operations = reconstruct_operations(ntfs_events, window_seconds=window_seconds)
     index = build_agent_index(events)

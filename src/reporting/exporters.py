@@ -493,7 +493,8 @@ def render_html_report(report: CaseReport) -> str:
         for service, count in sorted(service_counts.items(), key=lambda item: item[0] or "")
     )
 
-    return f"""<html><body style="font-family:Segoe UI,Arial,sans-serif;color:#1b1d22;">
+    return f"""<html><head><meta charset="utf-8"><title>TraceAgent Forensic Report</title></head>
+<body style="font-family:Segoe UI,Arial,sans-serif;color:#1b1d22;">
 <h1 style="font-size:20px;margin-bottom:0;">TraceAgent Forensic Report</h1>
 <p style="color:#5b6268;margin-top:4px;">
 Evidence source: {_esc(report.source_label)}<br/>

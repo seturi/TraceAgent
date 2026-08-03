@@ -5,7 +5,7 @@ import json
 import re
 import sqlite3
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -29,6 +29,10 @@ class SqliteRowRecord:
     table: str
     row_number: int
     values: dict[str, Any]
+    # Same row, before json_safe() summarizes BLOB columns down to a hash/hex
+    # preview - callers that need to look inside a BLOB (e.g. sniffing an
+    # embedded protobuf timestamp) need the actual bytes, not the summary.
+    raw_values: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +154,7 @@ def iter_sqlite_rows(
                     table,
                     row_number,
                     {key: json_safe(row[key]) for key in row.keys()},
+                    {key: row[key] for key in row.keys()},
                 )
     finally:
         connection.close()
@@ -179,6 +184,106 @@ def parse_timestamp(value: Any) -> datetime | None:
         except ValueError:
             return None
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+_PROTO_TIMESTAMP_MIN_SECONDS = 1_500_000_000  # 2017-07-14
+_PROTO_TIMESTAMP_MAX_SECONDS = 2_500_000_000  # 2049-03-01
+
+
+def _read_varint(data: bytes, pos: int) -> tuple[int, int]:
+    result = 0
+    shift = 0
+    while True:
+        if pos >= len(data):
+            raise ValueError("truncated varint")
+        byte = data[pos]
+        pos += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return result, pos
+        shift += 7
+        if shift > 63:
+            raise ValueError("varint too long")
+
+
+def _iter_proto_fields(data: bytes) -> Iterator[tuple[int, int, Any]]:
+    """Best-effort walk of protobuf wire-format bytes of unknown schema."""
+    pos = 0
+    length = len(data)
+    while pos < length:
+        try:
+            tag, pos = _read_varint(data, pos)
+        except ValueError:
+            return
+        field_no, wire_type = tag >> 3, tag & 0x7
+        if wire_type == 0:  # varint
+            try:
+                value, pos = _read_varint(data, pos)
+            except ValueError:
+                return
+            yield field_no, wire_type, value
+        elif wire_type == 2:  # length-delimited (bytes/string/submessage)
+            try:
+                size, pos = _read_varint(data, pos)
+            except ValueError:
+                return
+            if size < 0 or pos + size > length:
+                return
+            yield field_no, wire_type, data[pos : pos + size]
+            pos += size
+        elif wire_type == 1:  # fixed64
+            if pos + 8 > length:
+                return
+            pos += 8
+            yield field_no, wire_type, None
+        elif wire_type == 5:  # fixed32
+            if pos + 4 > length:
+                return
+            pos += 4
+            yield field_no, wire_type, None
+        else:  # groups (2, 3) or unknown - can't safely skip, stop here
+            return
+
+
+def sniff_proto_timestamp(blob: bytes, *, _depth: int = 0) -> datetime | None:
+    """Recover a ``google.protobuf.Timestamp`` embedded at an unknown depth
+    inside an otherwise-undocumented protobuf blob (e.g. Antigravity's SQLite
+    BLOB columns, which carry per-step creation time this way instead of in a
+    plain column - see parsers.antigravity._parse_database).
+
+    Schema-agnostic: walks the wire format looking for a length-delimited
+    submessage shaped *exactly* like ``{1: seconds (varint), 2: nanos
+    (varint)}`` with a seconds value in a plausible calendar-date range. That
+    exact shape plus range check makes an accidental match on unrelated bytes
+    very unlikely, but this is still a heuristic, not a schema - callers
+    should treat a ``None`` result as "no timestamp found", not "no timestamp
+    exists".
+    """
+    if _depth > 6:
+        return None
+    fields = list(_iter_proto_fields(blob))
+    if len(fields) == 2:
+        (field1, wire1, value1), (field2, wire2, value2) = fields
+        if (
+            field1 == 1
+            and wire1 == 0
+            and field2 == 2
+            and wire2 == 0
+            and isinstance(value1, int)
+            and isinstance(value2, int)
+            and _PROTO_TIMESTAMP_MIN_SECONDS <= value1 <= _PROTO_TIMESTAMP_MAX_SECONDS
+            and 0 <= value2 < 1_000_000_000
+        ):
+            try:
+                return datetime.fromtimestamp(value1, timezone.utc)
+            except (OSError, OverflowError, ValueError):
+                pass
+    for _, wire_type, value in fields:
+        if wire_type == 2 and isinstance(value, (bytes, bytearray)):
+            found = sniff_proto_timestamp(value, _depth=_depth + 1)
+            if found is not None:
+                return found
     return None
 
 
