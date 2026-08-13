@@ -2,7 +2,7 @@
 
 AI Agent Forensics
 
-Version: `1.2.260706`
+Version: `1.3.260812`
 
 ## Requirements
 

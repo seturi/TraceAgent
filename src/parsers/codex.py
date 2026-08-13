@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from collections.abc import Iterable
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from core.models import AgentAttribution, ArtifactRecord, EvidenceSource, NormalizedEvent
 from parsers.base import ArtifactParser, EventSink, ParseContext, ParserMetadata
 from utils.structured_data import file_timestamp, iter_sqlite_rows, parse_timestamp, sqlite_tables
+from utils.text_encoding import repair_text_tree
 from version import __version__
 
 _SERVICE_NAME = "Codex"
@@ -21,6 +25,25 @@ _LOG_DB_ARTIFACT_TYPE = "codex_log_db"
 _STATE_DB_ARTIFACT_TYPE = "codex_state_db"
 _SESSION_ARTIFACT_TYPE = "codex_session_jsonl"
 _HISTORY_ARTIFACT_TYPE = "codex_history_jsonl"
+
+_SESSION_ID_PATTERN = re.compile(
+    r"([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})",
+    re.IGNORECASE,
+)
+_TRANSCRIPT_BLOCK_PATTERN = re.compile(
+    r">>>\s*(?P<kind>TRANSCRIPT(?:\s+DELTA)?)\s+START\s*"
+    r"(?P<body>.*?)\s*>>>\s*(?P=kind)\s+END",
+    re.DOTALL | re.IGNORECASE,
+)
+_TRANSCRIPT_ENTRY_PATTERN = re.compile(
+    r"(?m)^\[(?P<index>\d+)]\s+"
+    r"(?:(?P<role>user|assistant)\s*:|tool\s+(?P<tool>.+?)\s+(?P<tool_kind>call|result)\s*:)\s*",
+    re.IGNORECASE,
+)
+_REVIEWED_SESSION_PATTERN = re.compile(
+    r"Reviewed Codex session id:\s*([0-9a-f-]{36})",
+    re.IGNORECASE,
+)
 
 _TIMESTAMP_COLUMN_CANDIDATES = (
     "timestamp", "created_at", "createdat", "updated_at", "updatedat",
@@ -134,9 +157,9 @@ def _derive_actor(record_type: str, payload: dict) -> str | None:
         if isinstance(role, str):
             return role
         sub_type = payload.get("type")
-        if sub_type == "function_call":
+        if sub_type in ("function_call", "custom_tool_call"):
             return "assistant"
-        if sub_type == "function_call_output":
+        if sub_type in ("function_call_output", "custom_tool_call_output"):
             return "tool"
         if sub_type == "reasoning":
             return "assistant"
@@ -184,7 +207,18 @@ def _derive_display(
                 _function_call_command(payload),
                 None,
             )
+        if sub_type == "custom_tool_call":
+            name = payload.get("name")
+            tool_input = payload.get("input")
+            return (
+                name if isinstance(name, str) else None,
+                tool_input if isinstance(tool_input, str) else _payload_fallback({"input": tool_input}),
+                None,
+            )
         if sub_type == "function_call_output":
+            output = payload.get("output")
+            return None, None, (output if isinstance(output, str) else None)
+        if sub_type == "custom_tool_call_output":
             output = payload.get("output")
             return None, None, (output if isinstance(output, str) else None)
         if sub_type == "reasoning":
@@ -208,6 +242,110 @@ def _derive_display(
     return None, None, None
 
 
+def expand_codex_embedded_transcript(
+    event: NormalizedEvent,
+) -> tuple[NormalizedEvent, ...]:
+    """Split an approval/subagent history wrapper into individual chat events.
+
+    Codex stores the reviewed parent transcript inside one subagent user message.
+    The wrapper remains available as low-signal evidence while the numbered
+    entries become normal USER/AGENT/TOOL rows for conversation reconstruction.
+    """
+    if (
+        event.event_type != "codex_event_msg.user_message"
+        or not event.result
+    ):
+        return (event,)
+    block = _TRANSCRIPT_BLOCK_PATTERN.search(event.result)
+    if block is None:
+        return (event,)
+    body = block.group("body")
+    matches = list(_TRANSCRIPT_ENTRY_PATTERN.finditer(body))
+    if not matches:
+        return (event,)
+
+    reviewed_match = _REVIEWED_SESSION_PATTERN.search(event.result)
+    reviewed_session_id = reviewed_match.group(1) if reviewed_match else None
+    target_session_id = (
+        reviewed_session_id
+        or event.metadata.get("parent_session_id")
+        or event.session_id
+    )
+    transcript_kind = "delta" if "DELTA" in block.group("kind").upper() else "full"
+    wrapper_metadata = {
+        **event.metadata,
+        "importance": "low",
+        "embedded_transcript_expanded": True,
+        "embedded_transcript_entries": len(matches),
+    }
+    wrapper = replace(event, metadata=wrapper_metadata)
+    expanded: list[NormalizedEvent] = [wrapper]
+    for position, match in enumerate(matches):
+        end = matches[position + 1].start() if position + 1 < len(matches) else len(body)
+        text = body[match.end() : end].strip()
+        role = (match.group("role") or "").lower()
+        tool_name = (match.group("tool") or "").strip() or None
+        tool_kind = (match.group("tool_kind") or "").lower()
+        if role == "user":
+            event_type = "codex_embedded_transcript.user_message"
+            actor = "user"
+            command = None
+            result = text
+        elif role == "assistant":
+            event_type = "codex_embedded_transcript.agent_message"
+            actor = "assistant"
+            command = None
+            result = text
+        elif tool_kind == "call":
+            event_type = "codex_embedded_transcript.tool_call"
+            actor = "assistant"
+            command = text
+            result = None
+        else:
+            event_type = "codex_embedded_transcript.tool_result"
+            actor = "tool"
+            command = None
+            result = text
+        fingerprint_source = "\0".join(
+            (event_type, actor, tool_name or "", command or "", result or "")
+        )
+        entry_fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
+        expanded.append(
+            NormalizedEvent(
+                source_id=event.source_id,
+                parser_id=event.parser_id,
+                timestamp=event.timestamp,
+                event_type=event_type,
+                service=event.service,
+                session_id=target_session_id,
+                actor=actor,
+                tool_name=tool_name,
+                command=command,
+                result=result,
+                attribution=event.attribution,
+                attribution_score=event.attribution_score,
+                attribution_reasons=event.attribution_reasons + ("codex_embedded_transcript",),
+                actor_class=event.actor_class,
+                raw_reference=(
+                    f"{event.raw_reference}:transcript={match.group('index')}"
+                    if event.raw_reference
+                    else None
+                ),
+                metadata={
+                    "embedded_transcript": True,
+                    "embedded_transcript_kind": transcript_kind,
+                    "embedded_transcript_fingerprint": entry_fingerprint,
+                    "transcript_index": int(match.group("index")),
+                    "transcript_role": role or f"tool_{tool_kind}",
+                    "reviewed_session_id": reviewed_session_id,
+                    "transcript_source_session_id": event.session_id,
+                    "wrapper_event_id": event.event_id,
+                },
+            )
+        )
+    return tuple(expanded)
+
+
 # Verified against a real state_*.sqlite `threads` table: `title` is a short
 # auto-generated summary distinct from `first_user_message` (the full raw
 # prompt text) - e.g. title="test3 폴더 생성" vs.
@@ -229,13 +367,26 @@ _TABLE_SESSION_ID_COLUMNS = {
 # The `logs` table is Codex's internal feedback/telemetry log, not conversation
 # content (unlike `threads`, which indexes actual sessions) - low-signal by
 # default so it doesn't crowd out prompts/tool calls/messages in the UI.
-_LOW_IMPORTANCE_TABLES = {"logs"}
+_LOW_IMPORTANCE_TABLES = {"logs", "threads"}
 
 # event_msg sub-types that are Codex's own streaming/lifecycle bookkeeping
 # (superseded by the final agent_message/agent_reasoning, or pure protocol
 # noise like token counts) rather than conversation content a reviewer needs
 # to read by default.
 _LOW_IMPORTANCE_EVENT_MSG_TYPES = {"agent_message_delta", "agent_reasoning_delta"}
+_LOW_IMPORTANCE_RESPONSE_ITEM_TYPES = {"message", "reasoning"}
+
+
+def _session_role(payload: dict) -> str | None:
+    source = payload.get("source")
+    if isinstance(source, dict):
+        subagent = source.get("subagent")
+        if isinstance(subagent, dict) and subagent.get("other") == "guardian":
+            return "guardian"
+        if subagent is not None:
+            return "subagent"
+    thread_source = payload.get("thread_source")
+    return thread_source if isinstance(thread_source, str) else None
 
 
 def _row_result(table_name: str, values: dict[str, object]) -> str | None:
@@ -427,6 +578,13 @@ class CodexParser(ArtifactParser):
         context: ParseContext,
     ) -> None:
         artifact_list = tuple(artifacts)
+        available_session_ids = {
+            session_id
+            for artifact in artifact_list
+            if artifact.artifact_type == _SESSION_ARTIFACT_TYPE
+            if (session_id := _session_id_from_path(Path(artifact.path)))
+        }
+        embedded_transcript_seen: set[tuple[str, str]] = set()
         total = len(artifact_list) or 1
         for index, artifact in enumerate(artifact_list):
             if context.cancelled():
@@ -438,7 +596,14 @@ class CodexParser(ArtifactParser):
                 elif artifact.artifact_type == _STATE_DB_ARTIFACT_TYPE:
                     self._parse_sqlite_table(source, artifact, "threads", emit, context)
                 elif artifact.artifact_type == _SESSION_ARTIFACT_TYPE:
-                    self._parse_session_jsonl(source, artifact, emit, context)
+                    self._parse_session_jsonl(
+                        source,
+                        artifact,
+                        emit,
+                        context,
+                        available_session_ids=available_session_ids,
+                        embedded_transcript_seen=embedded_transcript_seen,
+                    )
                 elif artifact.artifact_type == _HISTORY_ARTIFACT_TYPE:
                     self._parse_history_jsonl(source, artifact, emit, context)
             except Exception as exc:  # noqa: BLE001 - one bad artifact must not sink the rest
@@ -493,14 +658,28 @@ class CodexParser(ArtifactParser):
             )
 
     def _parse_session_jsonl(
-        self, source: EvidenceSource, artifact: ArtifactRecord, emit: EventSink, context: ParseContext
+        self,
+        source: EvidenceSource,
+        artifact: ArtifactRecord,
+        emit: EventSink,
+        context: ParseContext,
+        *,
+        available_session_ids: set[str],
+        embedded_transcript_seen: set[tuple[str, str]],
     ) -> None:
         session_path = Path(artifact.path)
         fallback_timestamp = file_timestamp(session_path)
-        current_session_id: str | None = None
+        # A rollout file is one state-db thread. Newer subagent/fork records also
+        # carry ``payload.session_id``, but that value is the parent thread and
+        # must not be used to group this file's conversation.
+        current_session_id = _session_id_from_path(session_path)
+        parent_session_id: str | None = None
+        primary_meta_seen = False
+        session_role: str | None = None
+        call_names: dict[str, str] = {}
 
         with session_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
+            for line_number, line in enumerate(handle, start=1):
                 if context.cancelled():
                     return
 
@@ -516,11 +695,41 @@ class CodexParser(ArtifactParser):
                 record_type = record.get("type", "unknown")
                 payload = record.get("payload")
                 payload = payload if isinstance(payload, dict) else {}
+                payload, encoding_repairs = repair_text_tree(payload)
 
-                if record_type == "session_meta":
-                    current_session_id = payload.get("session_id") or current_session_id
+                if record_type == "session_meta" and not primary_meta_seen:
+                    record_session_id = payload.get("id") or payload.get("session_id")
+                    if not current_session_id and isinstance(record_session_id, str):
+                        current_session_id = record_session_id
+                    candidate_parent = payload.get("session_id")
+                    if (
+                        isinstance(candidate_parent, str)
+                        and candidate_parent != current_session_id
+                    ):
+                        parent_session_id = candidate_parent
+                    primary_meta_seen = True
+                    session_role = _session_role(payload)
 
                 sub_type = payload.get("type") if record_type in ("event_msg", "response_item") else None
+                sanitized = _sanitize_payload(payload)
+                if encoding_repairs:
+                    sanitized["encoding_repairs"] = encoding_repairs
+                tool_name, command, result = _derive_display(record_type, payload, sanitized)
+                call_id = payload.get("call_id")
+                if (
+                    record_type == "response_item"
+                    and sub_type in ("function_call", "custom_tool_call")
+                    and isinstance(call_id, str)
+                    and tool_name
+                ):
+                    call_names[call_id] = tool_name
+                elif (
+                    record_type == "response_item"
+                    and sub_type in ("function_call_output", "custom_tool_call_output")
+                    and isinstance(call_id, str)
+                ):
+                    tool_name = call_names.get(call_id)
+
                 tool_family = _event_msg_tool_family(sub_type) if record_type == "event_msg" and sub_type else None
                 if tool_family:
                     # Give exec/patch/mcp *_begin/*_end pairs a tool_call/tool_result
@@ -528,13 +737,15 @@ class CodexParser(ArtifactParser):
                     # generic kind classifier recognizes them like Claude's tool blocks.
                     kind = "tool_call" if sub_type.endswith("_begin") else "tool_result"
                     event_type = f"codex_{kind}.{tool_family}"
+                elif record_type == "response_item" and sub_type == "custom_tool_call":
+                    event_type = f"codex_tool_call.{tool_name or 'custom'}"
+                elif record_type == "response_item" and sub_type == "custom_tool_call_output":
+                    event_type = f"codex_tool_result.{tool_name or 'custom'}"
                 elif sub_type:
                     event_type = f"codex_{record_type}.{sub_type}"
                 else:
                     event_type = f"codex_{record_type}"
                 timestamp = parse_timestamp(record.get("timestamp")) or fallback_timestamp
-                sanitized = _sanitize_payload(payload)
-                tool_name, command, result = _derive_display(record_type, payload, sanitized)
                 is_unrecognized = tool_name is None and command is None and result is None
                 if is_unrecognized:
                     result = _payload_fallback(sanitized)
@@ -543,28 +754,55 @@ class CodexParser(ArtifactParser):
                 # raw payload dump - that's exactly the noise a reviewer wants
                 # collapsed by default, along with streaming deltas that are
                 # superseded by their own final agent_message/agent_reasoning.
-                if is_unrecognized or sub_type in _LOW_IMPORTANCE_EVENT_MSG_TYPES:
-                    sanitized["importance"] = "low"
-
-                emit(
-                    NormalizedEvent(
-                        source_id=source.source_id,
-                        parser_id=self.metadata.parser_id,
-                        timestamp=timestamp,
-                        event_type=event_type,
-                        service=_SERVICE_NAME,
-                        session_id=current_session_id,
-                        actor=_derive_actor(record_type, payload),
-                        tool_name=tool_name,
-                        command=command,
-                        result=result,
-                        attribution=AgentAttribution.HIGH,
-                        attribution_score=0.8,
-                        attribution_reasons=("codex_desktop_session_log_path",),
-                        raw_reference=artifact.record_id,
-                        metadata=sanitized,
+                if (
+                    is_unrecognized
+                    or sub_type in _LOW_IMPORTANCE_EVENT_MSG_TYPES
+                    or (
+                        record_type == "response_item"
+                        and sub_type in _LOW_IMPORTANCE_RESPONSE_ITEM_TYPES
                     )
+                ):
+                    sanitized["importance"] = "low"
+                sanitized["artifact_session_id"] = current_session_id
+                if session_role:
+                    sanitized["session_role"] = session_role
+                if session_role == "guardian":
+                    sanitized["importance"] = "low"
+                if parent_session_id:
+                    sanitized["parent_session_id"] = parent_session_id
+
+                normalized_event = NormalizedEvent(
+                    source_id=source.source_id,
+                    parser_id=self.metadata.parser_id,
+                    timestamp=timestamp,
+                    event_type=event_type,
+                    service=_SERVICE_NAME,
+                    session_id=current_session_id,
+                    actor=_derive_actor(record_type, payload),
+                    tool_name=tool_name,
+                    command=command,
+                    result=result,
+                    attribution=AgentAttribution.HIGH,
+                    attribution_score=0.8,
+                    attribution_reasons=("codex_desktop_session_log_path",),
+                    raw_reference=f"{artifact.record_id}:line={line_number}",
+                    metadata=sanitized,
                 )
+                for expanded_event in expand_codex_embedded_transcript(normalized_event):
+                    fingerprint = expanded_event.metadata.get("embedded_transcript_fingerprint")
+                    if isinstance(fingerprint, str):
+                        target_session = expanded_event.session_id or ""
+                        # Guardian/approval transcripts are secondary copies of
+                        # the parent rollout. Keep the low-signal wrapper as raw
+                        # evidence, but prefer the canonical parent JSONL when it
+                        # was collected with this case.
+                        if target_session != current_session_id and target_session in available_session_ids:
+                            continue
+                        identity = (target_session, fingerprint)
+                        if identity in embedded_transcript_seen:
+                            continue
+                        embedded_transcript_seen.add(identity)
+                    emit(expanded_event)
 
     def _parse_history_jsonl(
         self, source: EvidenceSource, artifact: ArtifactRecord, emit: EventSink, context: ParseContext
@@ -600,3 +838,8 @@ class CodexParser(ArtifactParser):
 def _service_root(location: Path) -> Path:
     compact = location / "Codex"
     return compact if compact.is_dir() else location
+
+
+def _session_id_from_path(path: Path) -> str | None:
+    matches = _SESSION_ID_PATTERN.findall(path.name)
+    return matches[-1] if matches else None

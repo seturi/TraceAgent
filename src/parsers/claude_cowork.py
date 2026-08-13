@@ -285,7 +285,11 @@ class ClaudeCoworkParser(ArtifactParser):
                     service="Claude Cowork",
                     result=record.message,
                     raw_reference=f"{artifact.record_id}:line={record.line_number}",
-                    metadata={"level": record.level, "line_number": record.line_number},
+                    metadata={
+                        "level": record.level,
+                        "line_number": record.line_number,
+                        "importance": "low",
+                    },
                 )
             )
 

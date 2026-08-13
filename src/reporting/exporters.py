@@ -135,22 +135,19 @@ class CaseReport:
 
 
 # Events whose `result` is a session-level label rather than a prompt -
-# ChatGPT's cached conversation title/list entry, Codex's thread-summary row
-# (which itself already prefers an actual `title` column, verified against a
+# Codex's thread-summary row (which itself already prefers an actual `title` column, verified against a
 # real state_*.sqlite `threads` table - see parsers.codex._TABLE_RESULT_COLUMNS),
 # and Claude's own AI-generated session title record (verified against a real
 # ~/.claude/projects/**/*.jsonl sample: `{"type": "ai-title", "aiTitle": "...",
 # "sessionId": "..."}`, surfaced via `payload.get("aiTitle")` in claude_common).
 _TITLE_EVENT_TYPES = (
-    "chatgpt_conversation",
-    "chatgpt_conversation_list_item",
     "codex_threads_record",
     "claude_ai-title",
 )
 
-# Prompt events known to represent text typed but never sent, rather than an
-# actual sent message - everything else with actor="user" defaults to sent.
-_UNSENT_EVENT_TYPES = ("chatgpt_draft_prompt",)
+# Prompt events known to represent text typed but never sent. None of the
+# currently supported services expose a dedicated draft event.
+_UNSENT_EVENT_TYPES: tuple[str, ...] = ()
 
 
 def _is_tool_plumbing_event(event: NormalizedEvent) -> bool:

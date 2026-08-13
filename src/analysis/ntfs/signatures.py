@@ -20,12 +20,11 @@ from core.models import ActorClass
 # Actor keys used for service hints from NTFS flow alone.
 CLAUDE_COWORK = "Claude Cowork"
 CLAUDE_CODE = "Claude Code"
-CHATGPT = "ChatGPT Desktop"
 CODEX = "Codex"
 ANTIGRAVITY = "Antigravity"
 
 _TMP_RENAME_FAMILY = (CLAUDE_COWORK, CLAUDE_CODE, ANTIGRAVITY)
-_DIRECT_WRITE_FAMILY = (CHATGPT, CODEX)
+_DIRECT_WRITE_FAMILY = (CODEX,)
 
 # Application temp-file patterns that only appear when a *human* edits a file in
 # an interactive desktop application.
@@ -160,10 +159,6 @@ _SERVICE_OWNED_PATH_MARKERS = (
     "/claude/claude-code-sessions/",
     "/claude/logs/",
     "/claude-cli-nodejs/cache/",
-    "/chatgpt-desktop/local storage/leveldb/",
-    "/chatgpt-desktop/cache/cache_data/",
-    "/chatgpt/local storage/leveldb/",
-    "/chatgpt/cache/cache_data/",
     "/.codex/",
 )
 
@@ -392,7 +387,7 @@ def evaluate(op: FileOperation) -> ActorSignal:
         )
 
     if behavior == "modify" and "Object_ID_Changed" in op.reasons:
-        # ChatGPT/Codex content edit begins with an object-id change.
+        # A Codex content edit begins with an object-id change.
         return ActorSignal(
             ActorClass.AI_AGENT,
             behavior,

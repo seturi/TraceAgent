@@ -42,7 +42,6 @@ class ServiceDetection:
 SERVICE_NAMES = (
     "Claude Cowork",
     "Claude Code",
-    "ChatGPT Desktop",
     "Antigravity",
     "Codex",
 )
@@ -109,30 +108,6 @@ SERVICE_ARTIFACT_SPECS = (
         ("AppData/Local/Packages/Claude_*/LocalCache/Roaming/Claude/logs",),
         ("**/LocalCache/Roaming/Claude/logs",),
         include_file_patterns=("main.log",),
-    ),
-    ServiceArtifactSpec(
-        "ChatGPT Desktop",
-        "local_storage",
-        (
-            "AppData/Local/Packages/OpenAI.ChatGPT-Desktop_*/LocalCache/Roaming/ChatGPT-Desktop/Local Storage/leveldb",
-            "AppData/Local/Packages/OpenAI.ChatGPT-Desktop_*/LocalCache/Roaming/ChatGPT/Local Storage/leveldb",
-        ),
-        (
-            "**/LocalCache/Roaming/ChatGPT-Desktop/Local Storage/leveldb",
-            "**/LocalCache/Roaming/ChatGPT/Local Storage/leveldb",
-        ),
-    ),
-    ServiceArtifactSpec(
-        "ChatGPT Desktop",
-        "cache_data",
-        (
-            "AppData/Local/Packages/OpenAI.ChatGPT-Desktop_*/LocalCache/Roaming/ChatGPT-Desktop/Cache/Cache_Data",
-            "AppData/Local/Packages/OpenAI.ChatGPT-Desktop_*/LocalCache/Roaming/ChatGPT/Cache/Cache_Data",
-        ),
-        (
-            "**/LocalCache/Roaming/ChatGPT-Desktop/Cache/Cache_Data",
-            "**/LocalCache/Roaming/ChatGPT/Cache/Cache_Data",
-        ),
     ),
     ServiceArtifactSpec(
         "Antigravity",

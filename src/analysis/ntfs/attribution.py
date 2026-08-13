@@ -35,8 +35,6 @@ _FILE_ATTRIBUTE_DIRECTORY = 0x10
 _AI_SERVICES = {
     "Claude Cowork",
     "Claude Code",
-    "ChatGPT Desktop",
-    "ChatGPT",
     "Antigravity",
     "Codex",
 }

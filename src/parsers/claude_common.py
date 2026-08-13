@@ -9,6 +9,12 @@ from typing import Any
 from core.models import AgentAttribution, ArtifactRecord, EvidenceSource, NormalizedEvent
 from utils.structured_data import file_timestamp, json_safe, parse_timestamp
 
+_LOW_IMPORTANCE_RECORD_TYPES = {
+    "file-history-snapshot",
+    "file-history-delta",
+    "fork-context-ref",
+}
+
 
 def claude_record_events(
     source: EvidenceSource,
@@ -37,6 +43,8 @@ def claude_record_events(
         "line_number": line_number,
         "raw": json_safe(payload),
     }
+    if record_type in _LOW_IMPORTANCE_RECORD_TYPES:
+        base_metadata["importance"] = "low"
 
     content = message.get("content")
     if content is None:

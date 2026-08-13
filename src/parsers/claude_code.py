@@ -131,7 +131,11 @@ class ClaudeCodeParser(ArtifactParser):
                                 service=_SERVICE,
                                 result=record.message,
                                 raw_reference=f"{artifact.record_id}:line={record.line_number}",
-                                metadata={"level": record.level, "line_number": record.line_number},
+                                metadata={
+                                    "level": record.level,
+                                    "line_number": record.line_number,
+                                    "importance": "low",
+                                },
                             )
                         )
             except (OSError, ValueError) as exc:

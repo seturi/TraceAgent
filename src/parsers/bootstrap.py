@@ -1,5 +1,4 @@
 from parsers.antigravity import AntigravityParser
-from parsers.chatgpt import ChatGPTParser
 from parsers.claude_code import ClaudeCodeParser
 from parsers.claude_cowork import ClaudeCoworkParser
 from parsers.codex import CodexParser
@@ -15,7 +14,6 @@ def create_default_parser_registry() -> ParserRegistry:
         (
             ClaudeCodeParser(),
             ClaudeCoworkParser(),
-            ChatGPTParser(),
             AntigravityParser(),
             CodexParser(),
             NtfsUsnParser(),
