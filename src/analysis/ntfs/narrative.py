@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from analysis.narrative_common import Language, Narrative
 from analysis.ntfs.signatures import (
     FileOperation,
     has_app_temp,
@@ -37,7 +38,16 @@ from analysis.ntfs.signatures import (
 )
 from core.models import ActorClass
 
-Language = str  # "ko" | "en"
+__all__ = [
+    "BEHAVIOR_LABELS",
+    "Language",
+    "Narrative",
+    "REASON_PHRASES",
+    "behavior_label",
+    "describe_operation",
+    "reason_phrase",
+    "summarize_file",
+]
 
 # Behavior code -> short (Korean, English) label, used when chaining several
 # operations into one file-level headline.
@@ -166,29 +176,6 @@ def behavior_label(code: str, language: Language = "en") -> str:
     if labels is None:
         return code
     return labels[0] if language == "ko" else labels[1]
-
-
-@dataclass(frozen=True, slots=True)
-class Narrative:
-    """A bilingual interpretation: one headline plus supporting detail lines."""
-
-    headline_ko: str
-    headline_en: str
-    detail_ko: tuple[str, ...] = ()
-    detail_en: tuple[str, ...] = ()
-    key: str = ""  # stable interpretation id, e.g. "atomic_replace"
-
-    def headline(self, language: Language = "ko") -> str:
-        return self.headline_ko if language == "ko" else self.headline_en
-
-    def details(self, language: Language = "ko") -> tuple[str, ...]:
-        return self.detail_ko if language == "ko" else self.detail_en
-
-    def text(self, language: Language = "ko") -> str:
-        return "\n".join((self.headline(language), *self.details(language)))
-
-    def bilingual(self) -> str:
-        return f"{self.headline_ko}\n{self.headline_en}"
 
 
 @dataclass(frozen=True, slots=True)

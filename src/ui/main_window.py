@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
 from analysis.ntfs.attribution import OperationVerdict, attribute_ntfs_events, build_agent_index
 from analysis.ntfs.narrative import Narrative, summarize_file
 from analysis.ntfs.signatures import basename_of, normalize_path
+from analysis.session_narrative import describe_event, event_kind, summarize_session
 from collection.artifact_collector import ServiceArtifactCollector
 from collection.base import CollectionContext
 from collection.ntfs.collector import ExtractedNtfsArtifacts, NtfsArtifactCollector
@@ -1168,9 +1169,12 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Horizontal)
 
-        # Left: compact session cards with an explicit sort control.
+        # Left: compact session cards with an explicit sort control.  The
+        # minimum leaves room for a full session UUID while still letting the
+        # conversation and the interpretation pane have a usable width on a
+        # minimum-size window.
         nav = QFrame(objectName="Panel")
-        nav.setMinimumWidth(510)
+        nav.setMinimumWidth(340)
         nav_layout = QVBoxLayout(nav)
         nav_layout.setContentsMargins(8, 8, 8, 8)
         session_header_row = QHBoxLayout()
@@ -1212,8 +1216,19 @@ class MainWindow(QMainWindow):
         self.la_timeline_list.itemActivated.connect(self._on_timeline_selected)
         center_layout.addWidget(self.la_timeline_list, 1)
         splitter.addWidget(center)
+
+        # Right: what the reconstructed session actually means, in English then
+        # Korean — the counterpart of the NTFS view's interpretation panel.  It
+        # takes a lower minimum than the NTFS detail panel and stays collapsible
+        # so the conversation never loses its readable width on a small screen.
+        panel, self.la_interpretation = self._detail_panel("Interpretation / 해석", "")
+        panel.setMinimumWidth(240)
+        splitter.addWidget(panel)
+        splitter.setCollapsible(2, True)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 7)
+        splitter.setStretchFactor(2, 4)
+        splitter.setSizes((420, 620, 400))
         outer.addWidget(splitter, 1)
         return page
 
@@ -2342,6 +2357,7 @@ class MainWindow(QMainWindow):
         self._populate_local_service_filter(service_counts)
         self.la_timeline_list.clear()
         self.la_session_label.clear()
+        self.la_interpretation.clear()
         self._close_event_details()
         self._refresh_local_tree()
 
@@ -2371,6 +2387,7 @@ class MainWindow(QMainWindow):
         self._timeline_events = ()
         self.la_timeline_list.clear()
         self.la_session_label.clear()
+        self.la_interpretation.clear()
         self._close_event_details()
         self._refresh_local_tree()
 
@@ -2387,6 +2404,7 @@ class MainWindow(QMainWindow):
         self._timeline_events = ()
         self.la_timeline_list.clear()
         self.la_session_label.clear()
+        self.la_interpretation.clear()
         self._close_event_details()
         self._refresh_local_tree()
 
@@ -2461,6 +2479,7 @@ class MainWindow(QMainWindow):
         entry = getattr(self, "_sessions", {}).get(key) if key else None
         if entry is None:
             self.la_timeline_list.clear()
+            self.la_interpretation.clear()
             self._timeline_events = ()
             return
         kind_filter = _TYPE_FILTER.get(self.la_type.currentText())
@@ -2515,6 +2534,38 @@ class MainWindow(QMainWindow):
             f"{len(shown)}/{len(entry['events'])} shown"
             + (f"  ·  {duplicate_count} duplicate(s) hidden" if duplicate_count else "")
         )
+        self._render_session_interpretation(entry, tuple(shown))
+
+    def _render_session_interpretation(
+        self, entry: dict, shown: tuple[NormalizedEvent, ...]
+    ) -> None:
+        """Explain the selected session — who did what — in English, then Korean.
+
+        Interprets exactly the events on screen, and says how many records the
+        filters held back, so the narrative can never claim more coverage than
+        the reviewer is actually looking at.
+        """
+        narrative = summarize_session(
+            service=entry["service"],
+            events=shown,
+            hidden_count=max(0, len(entry["events"]) - len(shown)),
+        )
+        lines = [
+            f"Session  : {entry['session_id']}",
+            f"Service  : {entry['service']}",
+            f"Period   : {_format_local_datetime(entry['first'])} – "
+            f"{_format_local_datetime(entry['last'], '%H:%M:%S')}",
+            f"Events   : {len(shown):,} interpreted / {len(entry['events']):,} total",
+            "",
+            "══ Interpretation / 해석 ══",
+            "",
+            "[English]",
+            f"  {narrative.headline_en}",
+        ]
+        lines += [f"    {line}" for line in narrative.detail_en]
+        lines += ["", "[한국어]", f"  {narrative.headline_ko}"]
+        lines += [f"    {line}" for line in narrative.detail_ko]
+        self.la_interpretation.setPlainText("\n".join(lines))
 
     def _on_timeline_selected(
         self, current: QListWidgetItem | None,
@@ -2605,8 +2656,9 @@ class MainWindow(QMainWindow):
             item.setData(Qt.UserRole, f"file:{entry['key']}")
             if narrative is not None:
                 # The cell holds the Korean headline (elided); the tooltip carries
-                # both languages in full so nothing is lost to truncation.
-                item.setToolTip(narrative.bilingual())
+                # both languages in full so nothing is lost to truncation, English
+                # first to match the local-artifact interpretation panel.
+                item.setToolTip(narrative.bilingual(english_first=True))
             table.setItem(row, column, item)
 
     def _show_ntfs_detail(self) -> None:
@@ -2632,11 +2684,11 @@ class MainWindow(QMainWindow):
         ]
         narrative = entry.get("narrative")
         if narrative is not None:
-            lines += ["", "══ 해석 / Interpretation ══", ""]
-            lines += ["[한국어]", f"  {narrative.headline_ko}"]
-            lines += [f"    {line}" for line in narrative.detail_ko]
-            lines += ["", "[English]", f"  {narrative.headline_en}"]
+            lines += ["", "══ Interpretation / 해석 ══", ""]
+            lines += ["[English]", f"  {narrative.headline_en}"]
             lines += [f"    {line}" for line in narrative.detail_en]
+            lines += ["", "[한국어]", f"  {narrative.headline_ko}"]
+            lines += [f"    {line}" for line in narrative.detail_ko]
         lines += ["", "── Activity timeline ──"]
         if not ops:
             recovered = ", ".join(s for s, present in (("$MFT", mft), ("$LogFile", logs)) if present)
@@ -2647,11 +2699,11 @@ class MainWindow(QMainWindow):
                 f"[{_actor_class_label(verdict.actor_class, verdict.service)}]  {verdict.behavior}"
             )
             if verdict.narrative is not None:
-                lines.append(f"    ▸ {verdict.narrative.headline_ko}")
                 lines.append(f"    ▸ {verdict.narrative.headline_en}")
-                for line in verdict.narrative.detail_ko:
-                    lines.append(f"      {line}")
+                lines.append(f"    ▸ {verdict.narrative.headline_ko}")
                 for line in verdict.narrative.detail_en:
+                    lines.append(f"      {line}")
+                for line in verdict.narrative.detail_ko:
                     lines.append(f"      {line}")
             flow = self._operation_flow(verdict)
             if flow:
@@ -2877,30 +2929,24 @@ def _oneline(text: object) -> str:
     return " ".join(str(text).split())
 
 
+# Display kind -> the marker drawn on a conversation row.  The classification
+# itself lives in analysis.session_narrative so the row marker and the sentence
+# written about that row can never disagree about what the event is.
+_KIND_MARKERS = {
+    "log": "LOG",
+    "result": "OUT",
+    "tool": "TOOL",
+    "thinking": "THINK",
+    "prompt": "USER",
+    "message": "AGENT",
+    "event": "EVENT",
+}
+
+
 def _event_kind(event: NormalizedEvent) -> tuple[str, str]:
     """Classify a local-artifact event into a display kind + stable text marker."""
-    event_type = (event.event_type or "").lower()
-    actor = (event.actor or "").lower()
-    if "log" in event_type:
-        return ("LOG", "log")
-    if (
-        "tool_result" in event_type
-        or "function_call_output" in event_type
-        or "custom_tool_call_output" in event_type
-        or "tool-result" in event_type
-    ):
-        return ("OUT", "result")
-    if "tool_use" in event_type or "tool_call" in event_type or (
-        "function_call" in event_type and "output" not in event_type
-    ):
-        return ("TOOL", "tool")
-    if "thinking" in event_type or "reasoning" in event_type:
-        return ("THINK", "thinking")
-    if actor == "user" or "user" in event_type or "prompt" in event_type:
-        return ("USER", "prompt")
-    if actor == "assistant" or "assistant" in event_type or "message" in event_type:
-        return ("AGENT", "message")
-    return ("EVENT", "event")
+    kind = event_kind(event)
+    return (_KIND_MARKERS.get(kind, "EVENT"), kind)
 
 
 def _event_summary(event: NormalizedEvent, kind: str) -> str:
@@ -2915,6 +2961,15 @@ def _event_summary(event: NormalizedEvent, kind: str) -> str:
 def _event_detail_html(event: NormalizedEvent) -> str:
     marker, kind = _event_kind(event)
     summary = _event_summary(event, kind) or event.event_type
+    # What this one record means, before the raw fields it was derived from.
+    interpretation = describe_event(event)
+    interpretation_html = (
+        '<div class="block-label">INTERPRETATION / 해석</div>'
+        '<div class="interp"><div>{}</div><div class="interp-ko">{}</div></div>'.format(
+            html.escape(interpretation.headline_en),
+            html.escape(interpretation.headline_ko),
+        )
+    )
     fields = (
         ("Timestamp", _format_local_datetime(event.timestamp)),
         ("Service", event.service),
@@ -2953,8 +3008,11 @@ def _event_detail_html(event: NormalizedEvent) -> str:
     .value {{ color:#1C1917; font-size:13px; }}
     .block-label {{ margin-top:14px; }}
     .block {{ background:#FAFAF9; color:#292524; font-family:Consolas,monospace; font-size:12px; padding:10px; white-space:pre-wrap; }}
+    .interp {{ background:#FAFAF9; color:#1C1917; font-size:13px; line-height:1.5; padding:10px; margin-bottom:14px; }}
+    .interp-ko {{ color:#57534E; margin-top:4px; }}
     </style></head><body><div class="head"><span class="badge">{html.escape(marker)}</span>
-    <div class="title">{html.escape(summary)}</div></div>{field_html}{blocks}</body></html>
+    <div class="title">{html.escape(summary)}</div></div>
+    {interpretation_html}{field_html}{blocks}</body></html>
     """
 
 
