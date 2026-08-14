@@ -161,11 +161,19 @@ _PATH_LIKE_PATTERN = re.compile(
     r"[A-Za-z]:[\\/][^\s\"'|,;]+|(?:[\w.\-]+[\\/])+[\w.\-]+\.\w{1,8}"
 )
 
-_QUOTE_LIMIT = 140  # characters of prompt/reply text kept in a step sentence
-_COMMAND_LIMIT = 120
+# A step names the action and the thing it acted on, then stops: the object is
+# quoted inside the sentence rather than appended after it, and the output the
+# action produced is not narrated at all.  The conversation timeline beside the
+# panel is where a reviewer reads content; this panel is the index over it.
+_OBJECT_LIMIT = 60  # characters of the quoted command/query inside a sentence
 _MAX_STEPS = 12  # numbered steps shown before the roll-up says "and N more"
 _MAX_CHAIN = 6  # behaviors named in the headline chain
 _MAX_FILES = 8  # files named in the "files touched" line
+
+# Records that only report the aftermath of an action — a tool's output, an
+# application log line.  Still narratable one at a time in the event inspector,
+# but never a step of their own in a session roll-up.
+_AFTERMATH_BEHAVIORS = frozenset({"tool_result", "log"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,16 +248,23 @@ def summarize_session(
     files: list[str] = []
     has_user = False
     has_agent = False
+    actions = 0
     for event in events:
         step = _interpret_event(event)
-        behaviors.append(step.behavior)
-        if step.file_target and step.file_target not in files:
-            files.append(step.file_target)
         actor = (event.actor or "").lower()
         if step.behavior == "prompt" or actor == "user":
             has_user = True
         elif actor in {"assistant", "model", "agent"} or step.behavior != "log":
             has_agent = True
+        if step.file_target and step.file_target not in files:
+            files.append(step.file_target)
+        # A tool's output and an application log are the trace an action left
+        # behind, not an action of their own — they would double the step count
+        # while adding nothing about who did what.
+        if step.behavior in _AFTERMATH_BEHAVIORS:
+            continue
+        actions += 1
+        behaviors.append(step.behavior)
         # Collapse only sentences that are word-for-word identical, so a run of
         # reasoning steps folds into one line while two writes to different
         # files stay separate.
@@ -257,6 +272,9 @@ def summarize_session(
             steps[-1][1] += 1
             continue
         steps.append([step, 1])
+
+    if not steps:
+        return _empty_session(service, hidden_count)
 
     subject_en, subject_ko = _session_subject(service, has_user, has_agent)
     chain = list(dict.fromkeys(behaviors))[:_MAX_CHAIN]
@@ -268,11 +286,11 @@ def summarize_session(
 
     headline_en = (
         f"In this {service} session, {subject_en} carried out "
-        f"{len(events)} operations: {chain_en}."
+        f"{actions} operations: {chain_en}."
     )
     headline_ko = (
         f"이 세션({service})에서 {subject_ko} "
-        f"{len(events)}건의 작업을 수행했습니다: {chain_ko}."
+        f"{actions}건의 작업을 수행했습니다: {chain_ko}."
     )
 
     detail_en: list[str] = []
@@ -318,40 +336,40 @@ def _interpret_event(event: NormalizedEvent) -> _Step:
     file_target = _file_target(event) if behavior in _FILE_BEHAVIORS else None
 
     if behavior == "prompt":
-        quote = _quote(event.result or event.command, _QUOTE_LIMIT)
-        en = f"{actor_en} sent a prompt to {service}"
-        ko = f"{actor_ko} {service}에 프롬프트를 입력했습니다"
-        en, ko = _with_quote(en, ko, quote)
+        en = f"{actor_en} sent a prompt to {service}."
+        ko = f"{actor_ko} {service}에 프롬프트를 입력했습니다."
     elif behavior == "reply":
-        quote = _quote(event.result or event.command, _QUOTE_LIMIT)
-        en = f"{actor_en} replied"
-        ko = f"{actor_ko} 응답했습니다"
-        en, ko = _with_quote(en, ko, quote)
+        en = f"{actor_en} replied."
+        ko = f"{actor_ko} 응답했습니다."
     elif behavior == "reasoning":
-        en = f"{actor_en} reasoned internally before continuing."
-        ko = f"{actor_ko} 이어지는 작업에 앞서 내부 추론을 수행했습니다."
+        en = f"{actor_en} reasoned internally."
+        ko = f"{actor_ko} 내부 추론을 수행했습니다."
     elif behavior in _FILE_BEHAVIORS:
-        en, ko = _file_sentence(behavior, actor_en, actor_ko, file_target, tool)
+        en, ko = _file_sentence(behavior, actor_en, actor_ko, file_target)
     elif behavior == "shell":
-        command = _oneline(event.command or event.result, _COMMAND_LIMIT)
-        en = f"{actor_en} ran a shell command"
-        ko = f"{actor_ko} 셸 명령을 실행했습니다"
-        en = f"{en}: {command}" if command else f"{en}."
-        ko = f"{ko}: {command}" if command else f"{ko}."
+        command = _oneline(event.command or event.result, _OBJECT_LIMIT)
+        if command:
+            en = f'{actor_en} ran the command "{command}".'
+            ko = f'{actor_ko} "{command}" 명령을 실행했습니다.'
+        else:
+            en = f"{actor_en} ran a shell command."
+            ko = f"{actor_ko} 셸 명령을 실행했습니다."
     elif behavior == "search":
-        query = _oneline(event.command or event.path, _COMMAND_LIMIT)
+        query = _oneline(event.command or event.path, _OBJECT_LIMIT)
         if query:
-            en = f'{actor_en} searched the workspace for "{query}".'
-            ko = f'{actor_ko} "{query}" 조건으로 작업 공간을 검색했습니다.'
+            en = f'{actor_en} searched for "{query}".'
+            ko = f'{actor_ko} "{query}" 조건으로 검색했습니다.'
         else:
             en = f"{actor_en} searched the workspace."
             ko = f"{actor_ko} 작업 공간을 검색했습니다."
     elif behavior == "web":
-        target = _oneline(event.command or event.path or event.result, _COMMAND_LIMIT)
-        en = f"{actor_en} accessed the web"
-        ko = f"{actor_ko} 웹에 접근했습니다"
-        en = f"{en}: {target}" if target else f"{en}."
-        ko = f"{ko}: {target}" if target else f"{ko}."
+        target = _oneline(event.command or event.path, _OBJECT_LIMIT)
+        if target:
+            en = f'{actor_en} accessed "{target}".'
+            ko = f'{actor_ko} "{target}" 주소에 접근했습니다.'
+        else:
+            en = f"{actor_en} accessed the web."
+            ko = f"{actor_ko} 웹에 접근했습니다."
     elif behavior == "plan":
         en = f"{actor_en} updated its task plan."
         ko = f"{actor_ko} 작업 계획을 갱신했습니다."
@@ -364,29 +382,19 @@ def _interpret_event(event: NormalizedEvent) -> _Step:
         en = f"{actor_en} called an MCP tool."
         ko = f"{actor_ko} MCP 도구를 호출했습니다."
     elif behavior == "mcp":
-        server, name = _mcp_names(tool)
-        on_server_en = f" on the {server} server" if server else ""
-        on_server_ko = f"{server} 서버의 " if server else ""
-        en = f'{actor_en} called the MCP tool "{name}"{on_server_en}.'
-        ko = f'{actor_ko} {on_server_ko}MCP "{name}" 도구를 호출했습니다.'
+        _, name = _mcp_names(tool)
+        en = f'{actor_en} called the MCP tool "{name}".'
+        ko = f'{actor_ko} MCP "{name}" 도구를 호출했습니다.'
     elif behavior == "tool_call":
         name = tool or "unnamed"
-        argument = _oneline(event.command or event.path, _COMMAND_LIMIT)
-        en = f'{actor_en} called the "{name}" tool'
-        ko = f'{actor_ko} "{name}" 도구를 호출했습니다'
-        en = f"{en}: {argument}" if argument else f"{en}."
-        ko = f"{ko}: {argument}" if argument else f"{ko}."
+        en = f'{actor_en} called the "{name}" tool.'
+        ko = f'{actor_ko} "{name}" 도구를 호출했습니다.'
     elif behavior == "tool_result":
-        size = len(event.result or "")
         # Never str.capitalize() here — it would lower-case the tool's own name.
         subject_en = f'The "{tool}" tool' if tool else "A tool"
         subject_ko = f'"{tool}" 도구가' if tool else "도구가"
-        if size:
-            en = f"{subject_en} returned its output ({size:,} characters)."
-            ko = f"{subject_ko} 결과를 반환했습니다({size:,}자)."
-        else:
-            en = f"{subject_en} returned no output."
-            ko = f"{subject_ko} 결과를 반환하지 않았습니다."
+        en = f"{subject_en} returned its output."
+        ko = f"{subject_ko} 결과를 반환했습니다."
     elif behavior == "log":
         en = f"{actor_en} recorded a log entry."
         ko = f"{actor_ko} 로그를 기록했습니다."
@@ -445,9 +453,8 @@ def _file_sentence(
     actor_en: str,
     actor_ko: str,
     file_target: str | None,
-    tool: str,
 ) -> tuple[str, str]:
-    """Word a file operation, naming the tool that carried it out."""
+    """Word a file operation: who acted, on which file, and nothing further."""
     target_en = f'the file "{file_target}"' if file_target else "a file"
     target_ko = f'"{file_target}" 파일을' if file_target else "파일을"
     verbs = {
@@ -459,11 +466,9 @@ def _file_sentence(
         "file_delete": ("deleted", "삭제했습니다"),
     }
     verb_en, verb_ko = verbs[behavior]
-    with_tool_en = f" using the {tool} tool" if tool else ""
-    with_tool_ko = f"({tool} 도구)" if tool else ""
     return (
-        f"{actor_en} {verb_en} {target_en}{with_tool_en}.",
-        f"{actor_ko} {target_ko} {verb_ko}{with_tool_ko}.",
+        f"{actor_en} {verb_en} {target_en}.",
+        f"{actor_ko} {target_ko} {verb_ko}.",
     )
 
 
@@ -560,18 +565,8 @@ def _empty_session(service: str, hidden_count: int) -> Narrative:
     )
 
 
-def _with_quote(en: str, ko: str, quote: str) -> tuple[str, str]:
-    if not quote:
-        return f"{en}.", f"{ko}."
-    return f'{en}: "{quote}"', f'{ko}: "{quote}"'
-
-
 def _oneline(text: object, limit: int) -> str:
     if not text:
         return ""
     collapsed = " ".join(str(text).split())
     return collapsed if len(collapsed) <= limit else collapsed[: limit - 1] + "…"
-
-
-def _quote(text: object, limit: int) -> str:
-    return _oneline(text, limit)

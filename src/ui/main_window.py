@@ -2555,7 +2555,7 @@ class MainWindow(QMainWindow):
             f"Service  : {entry['service']}",
             f"Period   : {_format_local_datetime(entry['first'])} – "
             f"{_format_local_datetime(entry['last'], '%H:%M:%S')}",
-            f"Events   : {len(shown):,} interpreted / {len(entry['events']):,} total",
+            f"Events   : {len(shown):,} shown / {len(entry['events']):,} total",
             "",
             "══ Interpretation / 해석 ══",
             "",
